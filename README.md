@@ -38,8 +38,30 @@ Then open your Telegram bot and send `/start`.
 | `/inspo <pasted tweet>` | Manually add a tweet you like as trend/idea fuel (free, no API reads) |
 | `/style <example tweet>` | Add a voice example the bot will emulate (up to 10) |
 | `/template <structure>` | Add a structural template; one is picked at random per draft |
+| `/clip` | Source a fresh YouTube video, transcribe, find the best 1–4 min moment, render it 16:9 (X) + 9:16 (TikTok/X), send for review |
+| `/channels <urls>` | Show/set the YouTube source channels |
 | `/pause` / `/resume` | Stop/start scheduled drafts |
 | `/status` | Show settings and pending drafts |
+
+## Video clip pipeline
+`/clip` runs: **yt-dlp** (download newest unseen video) → **faster-whisper** (local transcription, CPU) → **Claude Haiku** (scores transcript, picks the spiciest 1–4 min moment + writes the caption) → **ffmpeg** (cuts it, renders a 9:16 blurred-fill vertical and a 16:9 landscape, burns the hook caption). The clip arrives in Telegram with buttons:
+
+- **✅ Post to X** — uploads the 16:9 natively and posts with the caption.
+- **📤 TikTok file** — sends you the 9:16 file + caption; tap to upload in the TikTok app (auto-publish needs TikTok app-audit approval; drafts/manual is the safe default).
+- **❌ Skip**
+
+> Note: a new/unverified X account caps native video at 2:20 — X Premium lifts this and is required for monetization eligibility anyway. Transcription runs on CPU (no GPU on Oracle free tier): ~30–90s per clip with the `base` model.
+
+## Deploy on Oracle Cloud (Ubuntu 22.04 ARM, Always Free)
+```bash
+git clone https://github.com/mzterwalexzyy/Automated-Viral-Tweet-bot.git
+cd Automated-Viral-Tweet-bot
+bash deploy/setup.sh        # installs ffmpeg + deps + systemd service
+nano .env                   # paste your keys
+sudo systemctl start xbot   # start it
+journalctl -u xbot -f       # watch logs
+```
+The bot runs 24/7 via systemd (auto-restart on crash/reboot). To avoid Oracle reclaiming an idle Always-Free VM, switch the account to Pay-As-You-Go (still $0 within free limits).
 
 ## How trend + style generation works
 Each draft prompt combines: recent posts from your watched accounts and `/inspo` posts (to ride current themes), your `/style` examples (voice to emulate), and optionally one of your `/template` structures. Watched accounts are fetched **once per day** because X's free tier only allows ~100 read requests/month — keep the watchlist to ~3 accounts on the free tier, or use `/inspo` freely (it costs nothing). The Basic tier ($200/mo) lifts read limits if you ever need more.

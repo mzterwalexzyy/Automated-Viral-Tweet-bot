@@ -28,7 +28,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from generator import generate_tweet
 from watchlist import fetch_watched_accounts, trending_context
-from x_client import post_tweet
+from x_client import post_tweet, post_video
+from video.pipeline import make_clip, DEFAULT_CHANNELS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("xbot")
@@ -48,6 +49,8 @@ DEFAULT_STATE = {
     "inspo": [],           # manually pasted tweets (trend/style fuel, no API reads)
     "styles": [],          # example tweets whose voice to emulate
     "templates": [],       # structural templates; one is picked at random if any
+    "channels": list(DEFAULT_CHANNELS),  # YouTube sources for clipping
+    "clips": {},           # clip_id -> clip job dict (pending review)
 }
 
 
@@ -133,6 +136,69 @@ async def do_post(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         await context.bot.send_message(CHAT_ID, f"⚠️ Post failed: {e}")
 
 
+# ---------- video clip flow ----------
+
+async def send_clip(context: ContextTypes.DEFAULT_TYPE, job: dict) -> None:
+    """Send a rendered clip to Telegram with platform action buttons."""
+    clip_id = str(STATE["next_id"])
+    STATE["next_id"] += 1
+    STATE["clips"][clip_id] = job
+    save_state(STATE)
+
+    dur = job["end"] - job["start"]
+    caption = (
+        f"🎬 Clip ({dur}s, score {job.get('score', '?')})\n"
+        f"From: {job['video_id']}\n"
+        f"Why: {job.get('reason', '')}\n\n"
+        f"📝 Caption:\n{job.get('caption', '')}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Post to X", callback_data=f"clipx:{clip_id}"),
+         InlineKeyboardButton("📤 TikTok file", callback_data=f"cliptt:{clip_id}")],
+        [InlineKeyboardButton("❌ Skip", callback_data=f"clipskip:{clip_id}")],
+    ])
+    # send the vertical preview if present, else landscape
+    files = job["files"]
+    preview = files.get("vertical") or files.get("landscape")
+    try:
+        with open(preview, "rb") as fh:
+            await context.bot.send_video(CHAT_ID, fh, caption=caption, reply_markup=kb)
+    except Exception:
+        log.exception("send_video failed; sending text only")
+        await context.bot.send_message(CHAT_ID, caption, reply_markup=kb)
+
+
+async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Source + render one fresh clip now and send it for review."""
+    if not authorized(update):
+        return
+    await update.message.reply_text(
+        "🎬 Sourcing a video, transcribing and finding the best moment… "
+        "(this can take a few minutes)")
+    try:
+        job = await asyncio.to_thread(make_clip, STATE["channels"], STATE["styles"])
+    except Exception as e:
+        log.exception("clip pipeline failed")
+        await update.message.reply_text(f"⚠️ Clip failed: {e}")
+        return
+    if not job:
+        await update.message.reply_text(
+            "No new clip found (no fresh source videos or no strong moment).")
+        return
+    await send_clip(context, job)
+
+
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show or set YouTube source channels. /channels url1 url2 ..."""
+    if not authorized(update):
+        return
+    if context.args:
+        STATE["channels"] = list(context.args)
+        save_state(STATE)
+    listing = "\n".join(f"- {c}" for c in STATE["channels"])
+    await update.message.reply_text(f"Source channels:\n{listing}")
+
+
 # ---------- command handlers ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,6 +215,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/inspo <tweet> – paste a tweet you like (trend fuel, no API reads)\n"
         "/style <tweet> – add a voice example to emulate\n"
         "/template <structure> – add a tweet template\n"
+        "/clip – source+cut a video clip now (review, post to X / TikTok)\n"
+        "/channels <urls> – set YouTube source channels\n"
         "/pause /resume /status"
     )
 
@@ -316,7 +384,44 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     q = update.callback_query
     await q.answer()
-    action, _, draft_id = q.data.partition(":")
+    action, _, ident = q.data.partition(":")
+
+    # ----- clip actions -----
+    if action.startswith("clip"):
+        job = STATE["clips"].get(ident)
+        if job is None:
+            await q.edit_message_caption("(clip expired)")
+            return
+        if action == "clipx":
+            vid = job["files"].get("landscape") or job["files"].get("vertical")
+            await q.edit_message_caption("Uploading to X…")
+            try:
+                url = await asyncio.to_thread(post_video, job.get("caption", ""), vid)
+                await context.bot.send_message(CHAT_ID, f"🚀 Posted to X: {url}")
+                STATE["clips"].pop(ident, None)
+                save_state(STATE)
+            except Exception as e:
+                log.exception("X video post failed")
+                await context.bot.send_message(CHAT_ID, f"⚠️ X post failed: {e}")
+        elif action == "cliptt":
+            # TikTok: deliver the 9:16 file + caption for one-tap upload in the app
+            vfile = job["files"].get("vertical")
+            cap = job.get("caption", "")
+            try:
+                with open(vfile, "rb") as fh:
+                    await context.bot.send_document(
+                        CHAT_ID, fh, filename=f"{job['video_id']}_tiktok.mp4",
+                        caption=f"TikTok caption:\n{cap}")
+            except Exception as e:
+                await context.bot.send_message(CHAT_ID, f"⚠️ Couldn't send file: {e}")
+        else:  # clipskip
+            STATE["clips"].pop(ident, None)
+            save_state(STATE)
+            await q.edit_message_caption("❌ Clip skipped.")
+        return
+
+    # ----- text draft actions -----
+    draft_id = ident
     text = STATE["drafts"].pop(draft_id, None)
     save_state(STATE)
     if text is None:
@@ -353,6 +458,8 @@ def main() -> None:
     app.add_handler(CommandHandler("inspo", cmd_inspo))
     app.add_handler(CommandHandler("style", cmd_style))
     app.add_handler(CommandHandler("template", cmd_template))
+    app.add_handler(CommandHandler("clip", cmd_clip))
+    app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Refresh trend data shortly before the first draft of the day
