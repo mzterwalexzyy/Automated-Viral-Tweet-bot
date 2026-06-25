@@ -6,12 +6,30 @@ Produces up to two files per clip:
 An optional hook caption is burned across the top.
 """
 import logging
+import os
 import subprocess
 from pathlib import Path
 
 log = logging.getLogger("xbot.editor")
 
 OUTDIR = Path(__file__).resolve().parent.parent / "work" / "clips"
+
+# drawtext needs an explicit font file (no fontconfig on Windows; Linux needs
+# the font installed). Override with FONT_FILE env if needed.
+_FONT_CANDIDATES = [
+    os.getenv("FONT_FILE", ""),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",      # Ubuntu (fonts-dejavu)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",                              # Windows
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+
+def _font_file() -> str | None:
+    for c in _FONT_CANDIDATES:
+        if c and Path(c).exists():
+            return c
+    return None
 
 
 def _esc(text: str) -> str:
@@ -20,12 +38,24 @@ def _esc(text: str) -> str:
                 .replace("'", "’").replace("%", "\\%"))
 
 
+def _font_arg() -> str:
+    font = _font_file()
+    if not font:
+        log.warning("no font file found; hook captions disabled")
+        return ""
+    # escape the Windows drive colon for ffmpeg's filter parser
+    return "fontfile='" + font.replace("\\", "/").replace(":", "\\:") + "':"
+
+
 def _drawtext(hook: str | None, width: int) -> str:
     if not hook:
         return ""
+    fontarg = _font_arg()
+    if not fontarg:
+        return ""
     fontsize = max(28, width // 24)
     return (
-        f",drawtext=text='{_esc(hook)}':fontcolor=white:fontsize={fontsize}:"
+        f",drawtext={fontarg}text='{_esc(hook)}':fontcolor=white:fontsize={fontsize}:"
         f"box=1:boxcolor=black@0.55:boxborderw=18:x=(w-text_w)/2:y=h*0.06:"
         f"line_spacing=8"
     )

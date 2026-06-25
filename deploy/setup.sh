@@ -8,7 +8,7 @@ echo ">> App dir: $APP_DIR"
 
 echo ">> Installing system packages (ffmpeg, python venv)…"
 sudo apt-get update -y
-sudo apt-get install -y ffmpeg python3-venv python3-pip
+sudo apt-get install -y ffmpeg python3-venv python3-pip fonts-dejavu-core
 
 echo ">> Creating virtualenv…"
 python3 -m venv "$APP_DIR/.venv"
