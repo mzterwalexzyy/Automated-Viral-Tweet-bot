@@ -78,25 +78,36 @@ def _watermark(handle: str | None, width: int) -> str:
     if not handle:
         return ""
     fontarg = _font_arg()
-    fontsize = max(20, width // 40)
+    if not fontarg:
+        return ""
+    fontsize = max(30, width // 26)          # bigger / bolder than before
+    pad = width // 40
     return (
-        f",drawtext={fontarg}text='{_esc(handle)}':fontcolor=white@0.85:"
-        f"fontsize={fontsize}:x=w-text_w-{width//40}:y={width//40}:"
-        f"shadowcolor=black@0.6:shadowx=2:shadowy=2"
+        f",drawtext={fontarg}text='{_esc(handle)}':fontcolor=white:"
+        f"fontsize={fontsize}:box=1:boxcolor=black@0.5:boxborderw=14:"
+        f"x=w-text_w-{pad}:y={pad}:"
+        f"shadowcolor=black@0.7:shadowx=2:shadowy=2"
     )
 
 
-def _banner(hook: str | None, width: int, height: int) -> str:
-    """Bottom title chyron with the hook line."""
+def _banner(hook: str | None, width: int, height: int,
+            position: str = "bottom") -> str:
+    """Title chyron: white box, red bold text with black outline.
+
+    position="top" for 9:16, "bottom" for 16:9 (kept clear of the captions).
+    """
     if not hook:
         return ""
     fontarg = _font_arg()
     if not fontarg:
         return ""
     fontsize = max(30, width // 22)
+    margin = int(height * 0.06)
+    y = str(margin) if position == "top" else f"h-text_h-{margin}"
     return (
-        f",drawtext={fontarg}text='{_esc(hook)}':fontcolor=white:fontsize={fontsize}:"
-        f"box=1:boxcolor=black@0.6:boxborderw=20:x=(w-text_w)/2:y=h-text_h-{height//22}:"
+        f",drawtext={fontarg}text='{_esc(hook)}':fontcolor=red:"
+        f"bordercolor=black:borderw=4:fontsize={fontsize}:"
+        f"box=1:boxcolor=white@0.92:boxborderw=22:x=(w-text_w)/2:y={y}:"
         f"line_spacing=6"
     )
 
@@ -119,7 +130,15 @@ def render(src: Path, start: int, end: int, slug: str, hook: str | None = None,
             ass = captions.build_ass(words, kind, OUTDIR / f"{slug}_{kind}.ass")
             if ass:
                 vf += f",subtitles='{_sub_path(ass)}'"
-        vf += _banner(hook, w, h) + _watermark(handle, w)
+        # banner at top for vertical, bottom for landscape (clear of captions)
+        if hook:
+            banner_pos = "top" if kind == "vertical" else "bottom"
+            bass = captions.build_banner_ass(
+                hook, kind, OUTDIR / f"{slug}_{kind}_banner.ass",
+                position=banner_pos, duration=dur)
+            if bass:
+                vf += f",subtitles='{_sub_path(bass)}'"
+        vf += _watermark(handle, w)
         cmd = ["ffmpeg", "-y", "-ss", str(start), "-t", str(dur), "-i", str(src),
                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                "-c:a", "aac", "-b:a", "128k", str(out)]

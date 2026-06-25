@@ -9,7 +9,7 @@ from pathlib import Path
 # Aspect-specific play resolution and font sizing.
 LAYOUTS = {
     "vertical": {"w": 1080, "h": 1920, "fontsize": 64, "margin_v": 420},
-    "landscape": {"w": 1920, "h": 1080, "fontsize": 56, "margin_v": 150},
+    "landscape": {"w": 1920, "h": 1080, "fontsize": 56, "margin_v": 240},
 }
 
 MAX_WORDS = 4
@@ -34,6 +34,49 @@ def _group(words: list[dict]) -> list[list[dict]]:
     if cur:
         phrases.append(cur)
     return phrases
+
+
+def build_banner_ass(hook: str, kind: str, out_path: Path,
+                     position: str = "top", duration: float = 9999.0) -> Path | None:
+    """Banner overlay: thick bold text on a solid white box.
+
+    Per-word colour via markup: words wrapped in *asterisks* render RED, all
+    other words render BLACK. e.g. 'RICK ROSS *GOES* OFF'.
+    """
+    if not hook or not hook.strip():
+        return None
+    lay = LAYOUTS[kind]
+    fontsize = 84 if kind == "vertical" else 72
+    # an=8 top-center for 9:16, an=2 bottom-center for 16:9
+    align = 8 if position == "top" else 2
+    margin_v = 130 if position == "top" else 70
+
+    BLACK = r"{\c&H000000&}"
+    RED = r"{\c&H0000FF&}"          # ASS is &HBBGGRR -> red
+    parts = []
+    for tok in hook.split():
+        red = tok.startswith("*") and tok.endswith("*") and len(tok) > 2
+        word = tok.strip("*").replace("{", "(").replace("}", ")")
+        parts.append((RED if red else BLACK) + word)
+    text = " ".join(parts)
+
+    # BorderStyle=3 + white OutlineColour => solid white box behind the text.
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {lay['w']}
+PlayResY: {lay['h']}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Banner,Arial Black,{fontsize},&H000000&,&H000000&,&H00FFFFFF&,&H00FFFFFF&,-1,0,0,0,100,100,1,0,3,16,0,{align},40,40,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, Effect, Text
+Dialogue: 0,0:00:00.00,{_ass_time(duration)},Banner,,0,0,0,,{text}
+"""
+    out_path.write_text(header, encoding="utf-8")
+    return out_path
 
 
 def build_ass(words: list[dict], kind: str, out_path: Path) -> Path | None:
