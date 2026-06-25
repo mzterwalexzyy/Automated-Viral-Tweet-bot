@@ -25,11 +25,11 @@ DEFAULT_CHANNELS = [
 
 
 def make_clip(channels: list[str] | None = None,
-              style_examples: list[str] | None = None) -> dict | None:
-    """Produce one clip job. Returns:
-       {"video_id", "score", "hook", "caption", "reason",
-        "start", "end", "files": {"vertical": path, "landscape": path}}
-    or None if nothing new / no good moment was found.
+              style_examples: list[str] | None = None,
+              handle: str | None = None) -> dict | None:
+    """Produce one clip job. Returns a dict with the rendered files plus the
+    clip metadata (intro/dialogue/hook/handles) needed to finalize the caption
+    after speaker names are confirmed. None if nothing new / no good moment.
     """
     channels = channels or DEFAULT_CHANNELS
     picked = sources.next_unprocessed(channels)
@@ -48,16 +48,19 @@ def make_clip(channels: list[str] | None = None,
             return None
         best = clips[0]
         slug = f"{video_id}_{int(time.time())}"
+        words = transcribe.words_in_range(segments, best["start"], best["end"])
         files = editor.render(
             src_path, best["start"], best["end"], slug,
-            hook=best.get("hook"))
+            hook=best.get("hook"), words=words, handle=handle)
         if not files:
             return None
         return {
             "video_id": video_id,
             "score": best.get("score"),
             "hook": best.get("hook", ""),
-            "caption": best.get("caption", ""),
+            "intro": best.get("intro", ""),
+            "dialogue": best.get("dialogue", []),
+            "handles": best.get("handles", []),
             "reason": best.get("reason", ""),
             "start": best["start"],
             "end": best["end"],

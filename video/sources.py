@@ -6,6 +6,7 @@ caller once clips are produced.
 """
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,17 @@ log = logging.getLogger("xbot.sources")
 WORKDIR = Path(__file__).resolve().parent.parent / "work"
 DOWNLOADS = WORKDIR / "downloads"
 SEEN_FILE = WORKDIR / "seen_videos.json"
+
+# YouTube blocks datacenter IPs without auth. Point YT_COOKIES at a cookies.txt
+# (exported from a logged-in browser) to authenticate. Falls back to a cookies
+# file at work/yt_cookies.txt if present.
+_DEFAULT_COOKIES = WORKDIR / "yt_cookies.txt"
+
+
+def cookie_args() -> list[str]:
+    path = os.getenv("YT_COOKIES") or (str(_DEFAULT_COOKIES)
+                                       if _DEFAULT_COOKIES.exists() else "")
+    return ["--cookies", path] if path and Path(path).exists() else []
 
 
 def _load_seen() -> set[str]:
@@ -31,7 +43,7 @@ def list_recent_video_ids(channel_url: str, limit: int = 5) -> list[str]:
     """Return the newest `limit` video IDs for a channel/playlist URL."""
     cmd = [
         "yt-dlp", "--flat-playlist", "--playlist-end", str(limit),
-        "--print", "%(id)s", channel_url,
+        *cookie_args(), "--print", "%(id)s", channel_url,
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
@@ -46,6 +58,7 @@ def download_video(video_id: str) -> Path | None:
     out_tmpl = str(DOWNLOADS / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
+        *cookie_args(),
         "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "--merge-output-format", "mp4",
         "-o", out_tmpl,

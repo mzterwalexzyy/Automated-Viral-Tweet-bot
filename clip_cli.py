@@ -53,7 +53,7 @@ def resolve_source(src: str) -> Path:
         out.mkdir(parents=True, exist_ok=True)
         import subprocess
         target = out / "cli_source.mp4"
-        cmd = ["yt-dlp", "-f",
+        cmd = ["yt-dlp", *sources.cookie_args(), "-f",
                "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
                "--merge-output-format", "mp4", "-o", str(target), src]
         if subprocess.run(cmd).returncode != 0 or not target.exists():
@@ -67,12 +67,10 @@ def resolve_source(src: str) -> Path:
     return path
 
 
-def auto_pick(path: Path) -> dict:
-    """Transcribe + let Claude choose the best moment."""
+def auto_pick_from(segments: list) -> dict:
+    """Let Claude choose the best moment from already-transcribed segments."""
     from video import transcribe
     from video.clipper import find_clips
-    log.info("Transcribing (this is the slow part on CPU)…")
-    segments = transcribe.transcribe(path)
     if not segments:
         log.error("no speech found")
         sys.exit(1)
@@ -93,26 +91,38 @@ def main() -> None:
     ap.add_argument("source", help="YouTube URL or local video file")
     ap.add_argument("--start", help="start timestamp (SS|MM:SS|HH:MM:SS)")
     ap.add_argument("--end", help="end timestamp (SS|MM:SS|HH:MM:SS)")
-    ap.add_argument("--hook", default=None, help="on-screen hook text")
+    ap.add_argument("--hook", default=None, help="on-screen banner text")
+    ap.add_argument("--handle", default=None, help="watermark handle, e.g. @you")
+    ap.add_argument("--captions", action="store_true",
+                    help="burn word-by-word karaoke captions (needs Whisper)")
     ap.add_argument("--vertical-only", action="store_true")
     ap.add_argument("--landscape-only", action="store_true")
     args = ap.parse_args()
 
     path = resolve_source(args.source)
 
+    words = None
     if args.start and args.end:
         start, end = parse_ts(args.start), parse_ts(args.end)
         hook = args.hook
+        if args.captions:
+            from video import transcribe
+            log.info("Transcribing for captions…")
+            segs = transcribe.transcribe(path)
+            words = transcribe.words_in_range(segs, start, end)
     else:
         log.info("No --start/--end given → using auto (Whisper + Claude).")
-        best = auto_pick(path)
+        from video import transcribe
+        segs = transcribe.transcribe(path)
+        best = auto_pick_from(segs)
         start, end = best["start"], best["end"]
         hook = args.hook if args.hook is not None else best.get("hook")
+        words = transcribe.words_in_range(segs, start, end)
 
     slug = f"cli_{int(time.time())}"
     log.info("Rendering %ss → %ss (%ss)…", start, end, end - start)
     files = editor.render(
-        path, start, end, slug, hook=hook,
+        path, start, end, slug, hook=hook, words=words, handle=args.handle,
         make_vertical=not args.landscape_only,
         make_landscape=not args.vertical_only,
     )

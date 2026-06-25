@@ -24,12 +24,13 @@ load_dotenv()
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes)
+                          ContextTypes, MessageHandler, filters)
 
 from generator import generate_tweet
 from watchlist import fetch_watched_accounts, trending_context
-from x_client import post_tweet, post_video
+from x_client import post_tweet, post_video, post_reply, tweet_url
 from video.pipeline import make_clip, DEFAULT_CHANNELS
+from video.clipper import build_caption, build_ft
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("xbot")
@@ -51,6 +52,8 @@ DEFAULT_STATE = {
     "templates": [],       # structural templates; one is picked at random if any
     "channels": list(DEFAULT_CHANNELS),  # YouTube sources for clipping
     "clips": {},           # clip_id -> clip job dict (pending review)
+    "awaiting_names": None,  # clip_id currently awaiting speaker-name reply
+    "handle": os.getenv("X_HANDLE", ""),  # watermark handle, e.g. @yourname
 }
 
 
@@ -138,34 +141,76 @@ async def do_post(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 # ---------- video clip flow ----------
 
+def _dialogue_preview(job: dict) -> str:
+    """Show the dialogue with speaker numbers so the user can map names."""
+    lines = []
+    for turn in job.get("dialogue", []):
+        lines.append(f'  Speaker {turn.get("speaker", 1)}: "{turn.get("text", "")}"')
+    return "\n".join(lines)
+
+
 async def send_clip(context: ContextTypes.DEFAULT_TYPE, job: dict) -> None:
-    """Send a rendered clip to Telegram with platform action buttons."""
+    """Send a rendered clip and ask for speaker names before posting."""
     clip_id = str(STATE["next_id"])
     STATE["next_id"] += 1
     STATE["clips"][clip_id] = job
+    STATE["awaiting_names"] = clip_id
     save_state(STATE)
 
     dur = job["end"] - job["start"]
-    caption = (
-        f"🎬 Clip ({dur}s, score {job.get('score', '?')})\n"
-        f"From: {job['video_id']}\n"
+    msg = (
+        f"🎬 Clip ({dur}s, score {job.get('score', '?')}) from {job['video_id']}\n"
         f"Why: {job.get('reason', '')}\n\n"
-        f"📝 Caption:\n{job.get('caption', '')}"
+        f"Intro: {job.get('intro', '')}\n\n"
+        f"Dialogue:\n{_dialogue_preview(job)}\n\n"
+        f"👉 Reply with the two speaker names like:  Speaker 1 | Speaker 2\n"
+        f"(e.g. Stephen A. Smith | Caleb Hammer)"
     )
+    files = job["files"]
+    preview = files.get("vertical") or files.get("landscape")
+    try:
+        with open(preview, "rb") as fh:
+            await context.bot.send_video(CHAT_ID, fh, caption=msg)
+    except Exception:
+        log.exception("send_video failed; sending text only")
+        await context.bot.send_message(CHAT_ID, msg)
+
+
+async def finalize_clip(context: ContextTypes.DEFAULT_TYPE, clip_id: str,
+                        name1: str, name2: str) -> None:
+    """Build the final caption from confirmed names and show post buttons."""
+    job = STATE["clips"].get(clip_id)
+    if not job:
+        return
+    job["caption"] = build_caption(job, name1, name2)
+    job["ft"] = build_ft(job)
+    STATE["awaiting_names"] = None
+    save_state(STATE)
+
+    text = f"📝 Final caption:\n\n{job['caption']}"
+    if job["ft"]:
+        text += f"\n\n↳ reply tweet: {job['ft']}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Post to X", callback_data=f"clipx:{clip_id}"),
          InlineKeyboardButton("📤 TikTok file", callback_data=f"cliptt:{clip_id}")],
         [InlineKeyboardButton("❌ Skip", callback_data=f"clipskip:{clip_id}")],
     ])
-    # send the vertical preview if present, else landscape
-    files = job["files"]
-    preview = files.get("vertical") or files.get("landscape")
-    try:
-        with open(preview, "rb") as fh:
-            await context.bot.send_video(CHAT_ID, fh, caption=caption, reply_markup=kb)
-    except Exception:
-        log.exception("send_video failed; sending text only")
-        await context.bot.send_message(CHAT_ID, caption, reply_markup=kb)
+    await context.bot.send_message(CHAT_ID, text, reply_markup=kb)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch speaker-name replies when a clip is awaiting them."""
+    if not authorized(update):
+        return
+    clip_id = STATE.get("awaiting_names")
+    if not clip_id or not update.message or not update.message.text:
+        return
+    raw = update.message.text
+    if "|" not in raw:
+        await update.message.reply_text("Send two names separated by |  e.g. Obama | Bartlett")
+        return
+    name1, _, name2 = raw.partition("|")
+    await finalize_clip(context, clip_id, name1.strip(), name2.strip())
 
 
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -176,7 +221,8 @@ async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎬 Sourcing a video, transcribing and finding the best moment… "
         "(this can take a few minutes)")
     try:
-        job = await asyncio.to_thread(make_clip, STATE["channels"], STATE["styles"])
+        job = await asyncio.to_thread(
+            make_clip, STATE["channels"], STATE["styles"], STATE.get("handle") or None)
     except Exception as e:
         log.exception("clip pipeline failed")
         await update.message.reply_text(f"⚠️ Clip failed: {e}")
@@ -390,14 +436,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action.startswith("clip"):
         job = STATE["clips"].get(ident)
         if job is None:
-            await q.edit_message_caption("(clip expired)")
+            await q.edit_message_text("(clip expired)")
             return
         if action == "clipx":
             vid = job["files"].get("landscape") or job["files"].get("vertical")
-            await q.edit_message_caption("Uploading to X…")
             try:
-                url = await asyncio.to_thread(post_video, job.get("caption", ""), vid)
-                await context.bot.send_message(CHAT_ID, f"🚀 Posted to X: {url}")
+                await q.edit_message_text("Uploading to X…")
+            except Exception:
+                pass
+            try:
+                tweet_id = await asyncio.to_thread(post_video, job.get("caption", ""), vid)
+                await context.bot.send_message(CHAT_ID, f"🚀 Posted to X: {tweet_url(tweet_id)}")
+                ft = job.get("ft", "")
+                if ft:
+                    reply_id = await asyncio.to_thread(post_reply, ft, tweet_id)
+                    await context.bot.send_message(
+                        CHAT_ID, f"↳ Ft. reply posted: {tweet_url(reply_id)}")
                 STATE["clips"].pop(ident, None)
                 save_state(STATE)
             except Exception as e:
@@ -416,8 +470,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(CHAT_ID, f"⚠️ Couldn't send file: {e}")
         else:  # clipskip
             STATE["clips"].pop(ident, None)
+            if STATE.get("awaiting_names") == ident:
+                STATE["awaiting_names"] = None
             save_state(STATE)
-            await q.edit_message_caption("❌ Clip skipped.")
+            await q.edit_message_text("❌ Clip skipped.")
         return
 
     # ----- text draft actions -----
@@ -461,6 +517,8 @@ def main() -> None:
     app.add_handler(CommandHandler("clip", cmd_clip))
     app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CallbackQueryHandler(on_button))
+    # plain-text replies (speaker names) — must be last so commands take priority
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Refresh trend data shortly before the first draft of the day
     app.job_queue.run_daily(refresh_watchlist, time=dtime(8, 30))

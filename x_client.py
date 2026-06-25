@@ -30,8 +30,12 @@ def _v1_api() -> tweepy.API:
     return tweepy.API(auth)
 
 
+def tweet_url(tweet_id: str) -> str:
+    return f"https://x.com/i/web/status/{tweet_id}"
+
+
 def post_video(text: str, video_path: str) -> str:
-    """Upload a video and post it with the given caption. Returns the tweet URL."""
+    """Upload a video and post it with the given caption. Returns the tweet id."""
     api = _v1_api()
     media = api.media_upload(
         filename=video_path, media_category="tweet_video", chunked=True,
@@ -47,4 +51,10 @@ def post_video(text: str, video_path: str) -> str:
         raise RuntimeError(f"X video processing failed: {info.get('error')}")
 
     resp = get_client().create_tweet(text=text, media_ids=[media.media_id])
-    return f"https://x.com/i/web/status/{resp.data['id']}"
+    return resp.data["id"]
+
+
+def post_reply(text: str, reply_to_id: str) -> str:
+    """Reply to a tweet. Returns the new tweet id."""
+    resp = get_client().create_tweet(text=text, in_reply_to_tweet_id=reply_to_id)
+    return resp.data["id"]

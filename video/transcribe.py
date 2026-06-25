@@ -22,12 +22,36 @@ def _model():
 
 
 def transcribe(path: Path) -> list[dict]:
-    segments, _info = _model().transcribe(str(path), vad_filter=True)
+    """Transcribe with word-level timestamps.
+
+    Returns segments: [{"start", "end", "text",
+                        "words": [{"start", "end", "word"}, ...]}, ...]
+    """
+    segments, _info = _model().transcribe(
+        str(path), vad_filter=True, word_timestamps=True)
     out = []
     for s in segments:
+        words = [{"start": round(w.start, 2), "end": round(w.end, 2),
+                  "word": w.word} for w in (s.words or [])]
         out.append({"start": round(s.start, 2), "end": round(s.end, 2),
-                    "text": s.text.strip()})
+                    "text": s.text.strip(), "words": words})
     log.info("transcribed %s into %d segments", path.name, len(out))
+    return out
+
+
+def words_in_range(segments: list[dict], start: float, end: float) -> list[dict]:
+    """Return word dicts within [start, end], with times rebased to the clip
+    (i.e. clip-relative seconds)."""
+    out = []
+    for s in segments:
+        for w in s.get("words", []):
+            if w["end"] <= start or w["start"] >= end:
+                continue
+            out.append({
+                "start": max(0.0, round(w["start"] - start, 2)),
+                "end": round(min(w["end"], end) - start, 2),
+                "word": w["word"].strip(),
+            })
     return out
 
 
