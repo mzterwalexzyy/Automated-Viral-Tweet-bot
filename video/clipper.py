@@ -32,16 +32,21 @@ For each clip write a CAPTION in this exact viral format (used by top clip accou
    "A wife claimed women are more free in Islam than any other religion."
    It must create a curiosity gap or hint at conflict. No hashtags, no emojis.
 2. "dialogue": the key exchange as an array of turns. Each turn is
-   {"speaker": <1 or 2>, "text": "<verbatim-ish quote, tightened>"}.
-   Use speaker 1 and speaker 2 consistently (the two main voices). 2-6 turns.
-3. "hook": a SHORT on-screen banner text (<=45 chars), punchy.
-4. "handles": array of @handles to tag (the show + notable people if known),
+   {"speaker": "<NAME>", "text": "<verbatim-ish quote, tightened>"}.
+   Use the speakers' REAL names/roles, exactly as a clip account would label them:
+   the host by name if recognizable (e.g. "Dave Ramsey", "Caleb", "Stephen A. Smith")
+   and the other person by role ("Caller", "Guest", "Caller"). 2-6 turns.
+3. "summary": ONE punchy payoff line recapping the stakes/outcome in plain words,
+   e.g. "$600K net worth at 26. Fiancee in PA school with debt. Dave says skip the prenup."
+4. "hook": a SHORT on-screen banner text (<=45 chars), punchy. Wrap the ONE word
+   that should pop in *asterisks* to render it red, e.g. "He LOST *$2M* overnight".
+5. "handles": array of @handles to tag (the show + notable people if known),
    e.g. ["@stephenasmith"]. Empty array if unknown.
 
 Return STRICT JSON only, no prose:
 {"clips": [{"start": <int>, "end": <int>, "score": <1-100>, "reason": "<why it pops>",
-"hook": "<banner text>", "intro": "<news-anchor line>",
-"dialogue": [{"speaker": 1, "text": "..."}, {"speaker": 2, "text": "..."}],
+"hook": "<banner text>", "intro": "<news-anchor line>", "summary": "<payoff line>",
+"dialogue": [{"speaker": "<name>", "text": "..."}, {"speaker": "<name>", "text": "..."}],
 "handles": ["@..."]}]}
 Order clips best-first. Return at most 4."""
 
@@ -77,19 +82,33 @@ def find_clips(transcript_text: str, style_examples: list[str] | None = None,
     return good
 
 
-def build_caption(clip: dict, name1: str = "Speaker 1",
-                  name2: str = "Speaker 2") -> str:
-    """Assemble the final post caption: news-anchor intro + dialogue block,
-    with speaker numbers replaced by the confirmed names."""
-    names = {1: name1, 2: name2}
+def build_caption(clip: dict, names: dict | None = None) -> str:
+    """Assemble the final post caption in the winning clip-account format:
+
+        <news-anchor intro line>
+
+        <Speaker>: "quote"
+        <Speaker>: "quote"
+
+        <summary payoff line>
+
+    `names` optionally remaps speaker labels the model produced (e.g. fixing a
+    misheard host name); by default the model's own labels are used as-is.
+    """
+    names = names or {}
     parts = [clip.get("intro", "").strip()]
     dialogue = clip.get("dialogue") or []
     if dialogue:
         parts.append("")  # blank line
         for turn in dialogue:
-            who = names.get(turn.get("speaker", 1), "Speaker")
+            who = str(turn.get("speaker", "Speaker"))
+            who = names.get(who, who)
             text = turn.get("text", "").strip().strip('"')
             parts.append(f'{who}: "{text}"')
+    summary = clip.get("summary", "").strip()
+    if summary:
+        parts.append("")
+        parts.append(summary)
     return "\n".join(p for p in parts if p is not None).strip()
 
 
