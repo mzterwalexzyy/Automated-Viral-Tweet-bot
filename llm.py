@@ -20,7 +20,11 @@ import os
 log = logging.getLogger("xbot.llm")
 
 
-def providers() -> list[tuple[str, str, str]]:
+def _truthy(v: str | None) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def providers() -> list[dict]:
     provs = []
     i = 1
     while True:
@@ -29,7 +33,12 @@ def providers() -> list[tuple[str, str, str]]:
         model = os.getenv(f"LLM{i}_MODEL")
         if not (base and key and model):
             break
-        provs.append((base, key, model))
+        provs.append({
+            "base": base, "key": key, "model": model,
+            # set LLM{i}_NO_THINKING=1 for reasoning models to suppress the
+            # <think> stream (cleaner JSON, faster). Safe to leave unset.
+            "no_thinking": _truthy(os.getenv(f"LLM{i}_NO_THINKING")),
+        })
         i += 1
     return provs
 
@@ -46,16 +55,20 @@ def chat(system: str, user: str, max_tokens: int = 2000,
             "(and LLM2_*, ... for fallbacks) in .env.")
 
     last_err: Exception | None = None
-    for base, key, model in provs:
+    for p in provs:
+        base, key, model = p["base"], p["key"], p["model"]
         try:
             client = OpenAI(base_url=base, api_key=key, timeout=120)
-            resp = client.chat.completions.create(
+            kwargs: dict = dict(
                 model=model,
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}],
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+            if p["no_thinking"]:
+                kwargs["extra_body"] = {"chat_template_kwargs": {"thinking": False}}
+            resp = client.chat.completions.create(**kwargs)
             content = (resp.choices[0].message.content or "").strip()
             if content:
                 log.info("llm ok via %s (%s)", base, model)
