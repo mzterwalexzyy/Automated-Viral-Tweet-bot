@@ -1,9 +1,8 @@
-"""Tweet generation using the Claude API, with style emulation and trend awareness."""
+"""Tweet generation via the OpenAI-compatible LLM client, with style emulation
+and trend awareness. Runs on whatever providers are configured in .env."""
 import random
 
-import anthropic
-
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+import llm
 
 SYSTEM = """You are a social media ghostwriter who writes high-engagement tweets.
 Rules:
@@ -61,11 +60,5 @@ def generate_tweet(
 
     prompt = f"Write one tweet about: {topic}." + "".join(parts)
 
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = msg.content[0].text.strip().strip('"')
+    text = llm.chat(SYSTEM, prompt, max_tokens=300, temperature=0.9).strip().strip('"')
     return text[:280]

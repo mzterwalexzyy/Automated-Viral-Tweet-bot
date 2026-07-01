@@ -1,20 +1,15 @@
-"""Use Claude to pick the most viral-worthy moments from a transcript.
+"""Pick the most viral-worthy moments from a transcript via an LLM.
 
-Returns clip candidates with start/end timestamps, a hook line, a suggested
-caption, and a score. The caller turns these into actual video files.
+Uses the OpenAI-compatible multi-provider client (llm.chat), so it runs on
+free providers (NVIDIA NIM, etc.) with automatic fallback. Returns clip
+candidates with start/end timestamps, hook, caption fields, and a score.
 """
 import json
 import logging
-import os
 
-import anthropic
+import llm
 
 log = logging.getLogger("xbot.clipper")
-
-client = anthropic.Anthropic()
-
-# Cheap + fast; this is a scan-and-rank job, not creative writing.
-MODEL = os.getenv("CLIP_MODEL", "claude-haiku-4-5-20251001")
 
 SYSTEM = """You are a viral short-form clip editor for X and TikTok. You are given a
 timestamped transcript of a long podcast/talk video. Find the BEST self-contained
@@ -58,14 +53,8 @@ def find_clips(transcript_text: str, style_examples: list[str] | None = None,
         joined = "\n".join(f"- {s}" for s in style_examples[:6])
         style = ("\n\nWrite the caption in the voice of these examples "
                  f"(style only):\n{joined}")
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        system=SYSTEM,
-        messages=[{"role": "user",
-                   "content": f"Transcript:\n{transcript_text}{style}"}],
-    )
-    raw = msg.content[0].text.strip()
+    raw = llm.chat(SYSTEM, f"Transcript:\n{transcript_text}{style}",
+                   max_tokens=2500, temperature=0.6).strip()
     raw = raw[raw.find("{"): raw.rfind("}") + 1]
     try:
         clips = json.loads(raw)["clips"][:max_clips]
