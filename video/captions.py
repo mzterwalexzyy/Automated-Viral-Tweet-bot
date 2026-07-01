@@ -53,8 +53,23 @@ def build_banner_ass(hook: str, kind: str, out_path: Path,
 
     BLACK = r"{\c&H000000&}"
     RED = r"{\c&H0000FF&}"          # ASS is &HBBGGRR -> red
+    tokens = hook.split()
+
+    # The LLM is asked to wrap one word in *asterisks* for red emphasis, but
+    # doesn't always comply. Guarantee the style anyway: if nothing is marked,
+    # pick the longest non-trivial word as a fallback emphasis candidate.
+    if not any(t.startswith("*") and t.endswith("*") and len(t) > 2 for t in tokens):
+        STOPWORDS = {"the", "a", "an", "to", "of", "and", "in", "on", "for",
+                    "is", "was", "his", "her", "he", "she", "it", "his", "him"}
+        candidates = [t for t in tokens if t.lower().strip(".,!?") not in STOPWORDS]
+        pool = candidates or tokens
+        if pool:
+            pick = max(pool, key=len)
+            idx = tokens.index(pick)
+            tokens[idx] = f"*{pick}*"
+
     parts = []
-    for tok in hook.split():
+    for tok in tokens:
         red = tok.startswith("*") and tok.endswith("*") and len(tok) > 2
         word = tok.strip("*").replace("{", "(").replace("}", ")")
         parts.append((RED if red else BLACK) + word)
