@@ -102,6 +102,7 @@ def main() -> None:
     path = resolve_source(args.source)
 
     words = None
+    caption = None
     if args.start and args.end:
         start, end = parse_ts(args.start), parse_ts(args.end)
         hook = args.hook
@@ -113,11 +114,20 @@ def main() -> None:
     else:
         log.info("No --start/--end given → using auto (Whisper + Claude).")
         from video import transcribe
+        from video.clipper import build_caption, build_ft
         segs = transcribe.transcribe(path)
         best = auto_pick_from(segs)
         start, end = best["start"], best["end"]
         hook = args.hook if args.hook is not None else best.get("hook")
         words = transcribe.words_in_range(segs, start, end)
+        caption = build_caption(best)
+        ft = build_ft(best)
+        if ft:
+            caption += f"\n\n{ft}"
+
+    if caption:
+        print("\n--- Post caption ---")
+        print(caption)
 
     slug = f"cli_{int(time.time())}"
     log.info("Rendering %ss → %ss (%ss)…", start, end, end - start)
