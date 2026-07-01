@@ -44,7 +44,7 @@ def providers() -> list[dict]:
 
 
 def chat(system: str, user: str, max_tokens: int = 2000,
-         temperature: float = 0.7) -> str:
+         temperature: float = 0.7, timeout: float = 240) -> str:
     """Return the assistant text, trying each configured provider in turn."""
     from openai import OpenAI
 
@@ -58,7 +58,7 @@ def chat(system: str, user: str, max_tokens: int = 2000,
     for p in provs:
         base, key, model = p["base"], p["key"], p["model"]
         try:
-            client = OpenAI(base_url=base, api_key=key, timeout=120)
+            client = OpenAI(base_url=base, api_key=key, timeout=timeout, max_retries=1)
             kwargs: dict = dict(
                 model=model,
                 messages=[{"role": "system", "content": system},
