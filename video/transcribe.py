@@ -59,6 +59,15 @@ def words_in_range(segments: list[dict], start: float, end: float) -> list[dict]
     return out
 
 
+def excerpt_text(segments: list[dict], start: float, end: float) -> str:
+    """Plain text actually spoken within [start, end] (absolute source time),
+    built from word-level timestamps for tight boundaries. This is the ground
+    truth handed to the caption-writing step so it cannot fabricate content
+    outside what was really said in the clip."""
+    words = words_in_range(segments, start, end)
+    return " ".join(w["word"] for w in words if w["word"]).strip()
+
+
 def to_transcript_text(segments: list[dict]) -> str:
     """Flatten segments into '[mm:ss] text' lines for the LLM to scan."""
     lines = []

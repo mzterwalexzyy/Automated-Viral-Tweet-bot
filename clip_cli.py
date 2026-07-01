@@ -77,7 +77,7 @@ def auto_pick_from(segments: list) -> dict:
     text = transcribe.to_transcript_text(segments)
     max_duration = max((s["end"] for s in segments), default=None)
     log.info("Asking Claude for the best moment…")
-    clips = find_clips(text, max_duration=max_duration)
+    clips = find_clips(text, segments, max_duration=max_duration)
     if not clips:
         log.error("no clip candidates")
         sys.exit(1)
