@@ -4,6 +4,7 @@ Words are grouped into short phrases (max ~4 words / ~2.5s). Within a phrase,
 each word sweeps from white to a highlight colour using ASS \\k karaoke timing,
 which is the look used by most viral clip channels.
 """
+import re
 from pathlib import Path
 
 # Aspect-specific play resolution and font sizing.
@@ -36,12 +37,53 @@ def _group(words: list[dict]) -> list[list[dict]]:
     return phrases
 
 
+_ASTERISK_SPAN = re.compile(r"\*([^*]+)\*")
+_STOPWORDS = {"the", "a", "an", "to", "of", "and", "in", "on", "for", "is",
+             "was", "his", "her", "he", "she", "it", "him", "with", "that"}
+
+
+def _fallback_emphasis(hook: str) -> str:
+    """Wrap an emphasis phrase in *asterisks* when the LLM didn't provide one.
+
+    Prefers a multi-word proper-noun-looking run (e.g. a movie title: "Reservoir
+    Dogs") over a single word, since titles/names read as one visual unit.
+    """
+    words = hook.split()
+    # find runs of consecutive Capitalized words (skip index 0: sentence-start
+    # capitalization isn't necessarily meaningful on its own)
+    best_run: list[int] = []
+    run: list[int] = []
+    for i, w in enumerate(words):
+        bare = w.strip(".,!?")
+        is_cap = bare[:1].isupper() and bare.lower() not in _STOPWORDS
+        if is_cap and i > 0:
+            run.append(i)
+        else:
+            if len(run) > len(best_run):
+                best_run = run
+            run = []
+    if len(run) > len(best_run):
+        best_run = run
+
+    if len(best_run) >= 2:
+        idxs = best_run
+    else:
+        candidates = [i for i, w in enumerate(words)
+                     if w.lower().strip(".,!?") not in _STOPWORDS]
+        pool = candidates or list(range(len(words)))
+        idxs = [max(pool, key=lambda i: len(words[i]))]
+
+    words[idxs[0]] = "*" + words[idxs[0]]
+    words[idxs[-1]] = words[idxs[-1]] + "*"
+    return " ".join(words)
+
+
 def build_banner_ass(hook: str, kind: str, out_path: Path,
                      position: str = "top", duration: float = 9999.0) -> Path | None:
     """Banner overlay: thick bold text on a solid white box.
 
-    Per-word colour via markup: words wrapped in *asterisks* render RED, all
-    other words render BLACK. e.g. 'RICK ROSS *GOES* OFF'.
+    Colour via markup: text wrapped in *asterisks* renders RED (can span
+    multiple words, e.g. a title: '*Reservoir Dogs*'), everything else BLACK.
     """
     if not hook or not hook.strip():
         return None
@@ -53,26 +95,24 @@ def build_banner_ass(hook: str, kind: str, out_path: Path,
 
     BLACK = r"{\c&H000000&}"
     RED = r"{\c&H0000FF&}"          # ASS is &HBBGGRR -> red
-    tokens = hook.split()
 
-    # The LLM is asked to wrap one word in *asterisks* for red emphasis, but
-    # doesn't always comply. Guarantee the style anyway: if nothing is marked,
-    # pick the longest non-trivial word as a fallback emphasis candidate.
-    if not any(t.startswith("*") and t.endswith("*") and len(t) > 2 for t in tokens):
-        STOPWORDS = {"the", "a", "an", "to", "of", "and", "in", "on", "for",
-                    "is", "was", "his", "her", "he", "she", "it", "his", "him"}
-        candidates = [t for t in tokens if t.lower().strip(".,!?") not in STOPWORDS]
-        pool = candidates or tokens
-        if pool:
-            pick = max(pool, key=len)
-            idx = tokens.index(pick)
-            tokens[idx] = f"*{pick}*"
+    # The LLM is asked to wrap the emphasis phrase in *asterisks*, but doesn't
+    # always comply - guarantee the style anyway.
+    if not _ASTERISK_SPAN.search(hook):
+        hook = _fallback_emphasis(hook)
 
     parts = []
-    for tok in tokens:
-        red = tok.startswith("*") and tok.endswith("*") and len(tok) > 2
-        word = tok.strip("*").replace("{", "(").replace("}", ")")
-        parts.append((RED if red else BLACK) + word)
+    pos = 0
+    for m in _ASTERISK_SPAN.finditer(hook):
+        before = hook[pos:m.start()]
+        if before.strip():
+            parts.append(BLACK + before.strip().replace("{", "(").replace("}", ")"))
+        span = m.group(1).replace("{", "(").replace("}", ")")
+        parts.append(RED + span)
+        pos = m.end()
+    tail = hook[pos:]
+    if tail.strip():
+        parts.append(BLACK + tail.strip().replace("{", "(").replace("}", ")"))
     text = " ".join(parts)
 
     # BorderStyle=3 + white OutlineColour => solid white box behind the text.

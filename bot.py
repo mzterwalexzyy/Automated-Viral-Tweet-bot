@@ -29,7 +29,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 from generator import generate_tweet
 from watchlist import fetch_watched_accounts, trending_context
 from x_client import post_tweet, post_video, post_reply, tweet_url
-from video.pipeline import make_clip, DEFAULT_CHANNELS
+from video.pipeline import make_clips, DEFAULT_CHANNELS
 from video.clipper import build_caption, build_ft
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -214,24 +214,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Source + render one fresh clip now and send it for review."""
+    """Source + render clips from a fresh video and send each for review.
+
+    Quality-gated: yields as many clips as clear the score bar (could be
+    0-4), not always exactly one."""
     if not authorized(update):
         return
     await update.message.reply_text(
-        "🎬 Sourcing a video, transcribing and finding the best moment… "
+        "🎬 Sourcing a video, transcribing and finding the best moment(s)… "
         "(this can take a few minutes)")
     try:
-        job = await asyncio.to_thread(
-            make_clip, STATE["channels"], STATE["styles"], STATE.get("handle") or None)
+        jobs = await asyncio.to_thread(
+            make_clips, STATE["channels"], STATE["styles"], STATE.get("handle") or None)
     except Exception as e:
         log.exception("clip pipeline failed")
         await update.message.reply_text(f"⚠️ Clip failed: {e}")
         return
-    if not job:
+    if not jobs:
         await update.message.reply_text(
             "No new clip found (no fresh source videos or no strong moment).")
         return
-    await send_clip(context, job)
+    if len(jobs) > 1:
+        await update.message.reply_text(f"Found {len(jobs)} strong moments — sending each:")
+    for job in jobs:
+        await send_clip(context, job)
 
 
 async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

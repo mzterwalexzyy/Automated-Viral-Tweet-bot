@@ -24,51 +24,53 @@ DEFAULT_CHANNELS = [
 ]
 
 
-def make_clip(channels: list[str] | None = None,
-              style_examples: list[str] | None = None,
-              handle: str | None = None) -> dict | None:
-    """Produce one clip job. Returns a dict with the rendered files plus the
-    clip metadata (intro/dialogue/hook/handles) needed to finalize the caption
-    after speaker names are confirmed. None if nothing new / no good moment.
-    """
+def make_clips(channels: list[str] | None = None,
+               style_examples: list[str] | None = None,
+               handle: str | None = None) -> list[dict]:
+    """Produce clip jobs for a fresh source video. Quality-gated, not a fixed
+    count: a video with several strong moments yields several rendered clips,
+    one with only one worth cutting yields one. Empty list if nothing new /
+    no candidate clears the bar."""
     channels = channels or DEFAULT_CHANNELS
     picked = sources.next_unprocessed(channels)
     if not picked:
         log.info("no new source videos")
-        return None
+        return []
     video_id, src_path = picked
     try:
         segments = transcribe.transcribe(src_path)
         if not segments:
-            return None
+            return []
         transcript = transcribe.to_transcript_text(segments)
         max_duration = max((s["end"] for s in segments), default=None)
         clips = find_clips(transcript, segments, style_examples=style_examples,
                            max_duration=max_duration)
         if not clips:
             log.info("no clip candidates in %s", video_id)
-            return None
-        best = clips[0]
-        slug = f"{video_id}_{int(time.time())}"
-        words = transcribe.words_in_range(segments, best["start"], best["end"])
-        files = editor.render(
-            src_path, best["start"], best["end"], slug,
-            hook=best.get("hook"), words=words, handle=handle)
-        if not files:
-            return None
-        return {
-            "video_id": video_id,
-            "score": best.get("score"),
-            "hook": best.get("hook", ""),
-            "intro": best.get("intro", ""),
-            "summary": best.get("summary", ""),
-            "dialogue": best.get("dialogue", []),
-            "handles": best.get("handles", []),
-            "reason": best.get("reason", ""),
-            "start": best["start"],
-            "end": best["end"],
-            "files": {k: str(v) for k, v in files.items()},
-        }
+            return []
+        jobs = []
+        for i, clip in enumerate(clips):
+            slug = f"{video_id}_{int(time.time())}_{i}"
+            words = transcribe.words_in_range(segments, clip["start"], clip["end"])
+            files = editor.render(
+                src_path, clip["start"], clip["end"], slug,
+                hook=clip.get("hook"), words=words, handle=handle)
+            if not files:
+                continue
+            jobs.append({
+                "video_id": video_id,
+                "score": clip.get("score"),
+                "hook": clip.get("hook", ""),
+                "intro": clip.get("intro", ""),
+                "summary": clip.get("summary", ""),
+                "dialogue": clip.get("dialogue", []),
+                "handles": clip.get("handles", []),
+                "reason": clip.get("reason", ""),
+                "start": clip["start"],
+                "end": clip["end"],
+                "files": {k: str(v) for k, v in files.items()},
+            })
+        return jobs
     finally:
         # source file is large; drop it once clips are rendered
         try:

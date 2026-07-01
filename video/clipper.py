@@ -57,8 +57,11 @@ Write:
 3. "summary": ONE punchy payoff line recapping the stakes/outcome, using only
    facts stated in the excerpt.
 4. "hook": a SHORT on-screen banner text (<=45 chars) drawn from the excerpt.
-   Wrap the ONE word that should pop in *asterisks* to render it red, e.g.
-   "He LOST *$2M* overnight".
+   Wrap the ONE phrase that should pop in *asterisks* to render it red — a
+   phrase can be multiple words if they're one unit (a movie/show title, a
+   full name, a dollar figure), e.g. "He LOST *$2M* overnight" or
+   "He brought *Reservoir Dogs* to impress him". Wrap the whole unit, not
+   just one word of it.
 5. "handles": array of @handles to tag, ONLY if a show/person is explicitly
    named in the excerpt. Empty array otherwise — never guess.
 
@@ -115,31 +118,46 @@ def caption_for(excerpt_text: str, style_examples: list[str] | None = None) -> d
         return {}
 
 
+DEFAULT_MIN_SCORE = 75
+
+
 def find_clips(transcript_text: str, segments: list[dict],
                style_examples: list[str] | None = None, max_clips: int = 4,
-               max_duration: float | None = None) -> list[dict]:
+               max_duration: float | None = None,
+               min_score: int = DEFAULT_MIN_SCORE) -> list[dict]:
     """Orchestrates pick_moments -> caption_for (grounded in the real excerpt)
-    for the top candidate, returning the same merged shape callers expect:
-    {start, end, score, reason, hook, intro, summary, dialogue, handles}.
-    Only the top pick gets a caption generated (2nd LLM call) to keep this to
-    one extra call per clip; callers only ever use clips[0] today."""
+    for every candidate that clears the quality bar, returning a list of merged
+    dicts: {start, end, score, reason, hook, intro, summary, dialogue, handles}.
+
+    Quality-gated, not a fixed quota: a video with several strong, unrelated
+    moments yields several clips; a video with only one worth cutting yields
+    one. If NOTHING clears min_score, the single best candidate is still
+    captioned so callers are never left completely empty-handed."""
     from . import transcribe  # local import: avoid a hard dependency cycle
 
     picks = pick_moments(transcript_text, max_clips=max_clips,
                         max_duration=max_duration)
     if not picks:
         return []
-    best = picks[0]
-    excerpt = transcribe.excerpt_text(segments, best["start"], best["end"])
-    if not excerpt.strip():
-        log.error("no real transcript text found for %s-%s; refusing to caption",
-                  best["start"], best["end"])
-        return []
-    cap = caption_for(excerpt, style_examples=style_examples)
-    if not cap:
-        return []
-    best = {**best, **cap}
-    return [best]
+
+    keep = [p for p in picks if (p.get("score") or 0) >= min_score]
+    if not keep:
+        log.info("no candidate cleared min_score=%d; falling back to top pick "
+                 "(score %s)", min_score, picks[0].get("score"))
+        keep = picks[:1]
+
+    results = []
+    for pick in keep:
+        excerpt = transcribe.excerpt_text(segments, pick["start"], pick["end"])
+        if not excerpt.strip():
+            log.error("no real transcript text found for %s-%s; skipping",
+                      pick["start"], pick["end"])
+            continue
+        cap = caption_for(excerpt, style_examples=style_examples)
+        if not cap:
+            continue
+        results.append({**pick, **cap})
+    return results
 
 
 def build_caption(clip: dict, names: dict | None = None) -> str:
