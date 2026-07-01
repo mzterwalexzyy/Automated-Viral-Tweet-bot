@@ -61,10 +61,25 @@ def _drawtext(hook: str | None, width: int) -> str:
     )
 
 
-def _run(cmd: list[str]) -> bool:
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if out.returncode != 0:
-        log.error("ffmpeg failed: %s", out.stderr.strip()[-600:])
+def _run(cmd: list[str], min_duration: float, out_path: Path) -> bool:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if result.returncode != 0:
+        log.error("ffmpeg failed: %s", result.stderr.strip()[-600:])
+        return False
+    # A zero-exit-code run can still produce a near-empty file if -ss seeked
+    # past the source's actual end (e.g. an upstream timestamp bug fed us an
+    # out-of-range start). Verify the output really has the expected length.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(out_path)],
+        capture_output=True, text=True, timeout=30)
+    try:
+        actual = float(probe.stdout.strip())
+    except ValueError:
+        actual = 0.0
+    if actual < min_duration * 0.5:
+        log.error("render produced a truncated/empty file (%.1fs, expected ~%.1fs): %s",
+                  actual, min_duration, out_path)
         return False
     return True
 
@@ -142,7 +157,7 @@ def render(src: Path, start: int, end: int, slug: str, hook: str | None = None,
         cmd = ["ffmpeg", "-y", "-ss", str(start), "-t", str(dur), "-i", str(src),
                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                "-c:a", "aac", "-b:a", "128k", str(out)]
-        return _run(cmd)
+        return _run(cmd, dur, out)
 
     if make_vertical:
         out = OUTDIR / f"{slug}_9x16.mp4"

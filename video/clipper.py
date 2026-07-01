@@ -47,7 +47,11 @@ Order clips best-first. Return at most 4."""
 
 
 def find_clips(transcript_text: str, style_examples: list[str] | None = None,
-               max_clips: int = 4) -> list[dict]:
+               max_clips: int = 4, max_duration: float | None = None) -> list[dict]:
+    """max_duration: the real length (seconds) of the source media. LLMs can
+    hallucinate timestamps beyond the actual transcript (grounding failures),
+    so any clip touching or exceeding this is dropped rather than fed to
+    ffmpeg, which would silently seek past EOF and render an empty file."""
     style = ""
     if style_examples:
         joined = "\n".join(f"- {s}" for s in style_examples[:6])
@@ -61,10 +65,16 @@ def find_clips(transcript_text: str, style_examples: list[str] | None = None,
     except (json.JSONDecodeError, KeyError) as e:
         log.error("clip JSON parse failed: %s\n%s", e, raw[:500])
         return []
-    # sanity-clamp durations
+    # sanity-clamp durations and reject out-of-bounds (hallucinated) timestamps
     good = []
     for c in clips:
         if not isinstance(c.get("start"), int) or not isinstance(c.get("end"), int):
+            continue
+        if c["start"] < 0 or c["end"] <= c["start"]:
+            continue
+        if max_duration is not None and c["end"] > max_duration:
+            log.warning("dropping out-of-bounds clip %s-%s (source is %.0fs)",
+                       c["start"], c["end"], max_duration)
             continue
         if 20 <= (c["end"] - c["start"]) <= 300:
             good.append(c)

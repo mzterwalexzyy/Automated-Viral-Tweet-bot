@@ -42,7 +42,9 @@ def make_clip(channels: list[str] | None = None,
         if not segments:
             return None
         transcript = transcribe.to_transcript_text(segments)
-        clips = find_clips(transcript, style_examples=style_examples)
+        max_duration = max((s["end"] for s in segments), default=None)
+        clips = find_clips(transcript, style_examples=style_examples,
+                           max_duration=max_duration)
         if not clips:
             log.info("no clip candidates in %s", video_id)
             return None
