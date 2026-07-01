@@ -27,8 +27,12 @@ def transcribe(path: Path) -> list[dict]:
     Returns segments: [{"start", "end", "text",
                         "words": [{"start", "end", "word"}, ...]}, ...]
     """
+    # vad_filter=True is known to drift segment timestamps out of sync with
+    # the real file timeline on some faster-whisper versions (silence removal
+    # shifts the reported clock). Since we cut the source file using these
+    # exact timestamps, drift = wrong footage gets clipped. Keep it off.
     segments, _info = _model().transcribe(
-        str(path), vad_filter=True, word_timestamps=True)
+        str(path), vad_filter=False, word_timestamps=True)
     out = []
     for s in segments:
         words = [{"start": round(w.start, 2), "end": round(w.end, 2),
