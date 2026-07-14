@@ -21,22 +21,45 @@ import llm
 
 log = logging.getLogger("xbot.clipper")
 
-PICK_SYSTEM = """You are a viral short-form clip scout for X and TikTok. You are
-given a timestamped transcript of a long podcast/talk video. Find the BEST
-self-contained moments to clip. A great clip:
-- is 60-240 seconds long (target ~120s), starts on a strong hook, ends on a punch
-- contains a hot take, brutal advice, a shocking claim, a heated argument, an
-  emotional confession, or a surprising story — something that makes people stop
-- features a RECOGNIZABLE person or a high-controversy topic
-- stands alone without needing prior context
+PICK_SYSTEM = """You are a viral short-form clip scout for X and TikTok, as sharp
+as the editors behind the top-performing clip accounts in this space (accounts
+that transcribe podcast moments as X posts and regularly hit 1-7M views).
+
+You are given a timestamped transcript of a long podcast/talk video. Find the
+BEST self-contained moments to clip (60-240s, target ~120s).
+
+Score EVERY candidate on these 5 axes, each an integer 0 to its max:
+- "hook" (0-25): Does it open on a line that stops the scroll — a shocking
+  claim, direct address, or vivid image — within the first few seconds?
+- "controversy" (0-25): A hot take, brutal honesty, a heated disagreement, an
+  emotional confession, or a claim people will want to argue about in replies.
+- "standalone" (0-20): Fully understandable with ZERO outside context — no
+  dangling pronouns or callbacks to something not heard in this window.
+- "recognizability" (0-15): A known person, show, or topic that carries
+  built-in interest even for someone who's never seen this podcast.
+- "quotability" (0-15): Contains a short, punchy line that works verbatim as
+  an on-screen banner and as the tweet's opening hook line.
+
+Calibration — the PATTERN of what wins (not literal content to copy):
+- A caller reveals a specific, surprising financial detail and a host gives
+  blunt, quotable advice back (scores high: controversy + quotability).
+- A guest makes a provocative claim about a hot-button topic and the host
+  pushes back with a sharp counter (scores high: controversy + hook).
+- A recognizable guest reveals an ambitious, concrete plan or number in real
+  time (scores high: recognizability + hook).
+- A guest tells a short, self-contained funny/embarrassing story with a clean
+  punchline (scores high: standalone + quotability, lower controversy is fine).
 
 Only report moments that are ACTUALLY PRESENT in the transcript below — never
 invent or assume content from general knowledge of who the speakers are.
 
 Return STRICT JSON only, no prose:
-{"clips": [{"start": <int>, "end": <int>, "score": <1-100>, "reason": "<why it pops>"}]}
-Order clips best-first. Return at most 4. start/end are seconds and MUST fall
-within the transcript's timestamp range."""
+{"clips": [{"start": <int>, "end": <int>,
+"scores": {"hook": <int>, "controversy": <int>, "standalone": <int>,
+"recognizability": <int>, "quotability": <int>},
+"reason": "<one line: which axes it wins on and why>"}]}
+Order clips best-first by total score. Return at most 4. start/end are seconds
+and MUST fall within the transcript's timestamp range."""
 
 CAPTION_SYSTEM = """You are writing a viral X/TikTok post caption for a clip, in
 the exact format used by top clip accounts. You are given ONLY the literal
@@ -70,16 +93,35 @@ Return STRICT JSON only, no prose:
 "dialogue": [{"speaker": "...", "text": "..."}], "handles": ["@..."]}"""
 
 
+# axis -> max points. Total score is always recomputed from these server-side
+# (clamped to [0, max] each) rather than trusted from any model-provided sum,
+# so a model arithmetic slip can't silently corrupt the min_score gate.
+SCORE_AXES = {"hook": 25, "controversy": 25, "standalone": 20,
+             "recognizability": 15, "quotability": 15}
+
+
+def _score(clip: dict) -> int:
+    axes = clip.get("scores") or {}
+    total = 0
+    for axis, max_pts in SCORE_AXES.items():
+        try:
+            v = int(axes.get(axis, 0))
+        except (TypeError, ValueError):
+            v = 0
+        total += max(0, min(max_pts, v))
+    return total
+
+
 def pick_moments(transcript_text: str, max_clips: int = 4,
                  max_duration: float | None = None) -> list[dict]:
-    """Step 1: pick candidate {start, end, score, reason} windows only — no
+    """Step 1: pick candidate {start, end, scores, reason} windows only — no
     caption content yet, so there is nothing here for the model to fabricate
     beyond timestamps. max_duration is the real source length in seconds;
     LLMs can still hallucinate timestamps past the transcript's real range,
     so anything touching or exceeding it is dropped (would otherwise make
     ffmpeg seek past EOF and silently render an empty file)."""
     raw = llm.chat(PICK_SYSTEM, f"Transcript:\n{transcript_text}",
-                   max_tokens=1200, temperature=0.5).strip()
+                   max_tokens=1500, temperature=0.5).strip()
     raw = raw[raw.find("{"): raw.rfind("}") + 1]
     try:
         clips = json.loads(raw)["clips"][:max_clips]
@@ -97,7 +139,9 @@ def pick_moments(transcript_text: str, max_clips: int = 4,
                        c["start"], c["end"], max_duration)
             continue
         if 20 <= (c["end"] - c["start"]) <= 300:
+            c["score"] = _score(c)
             good.append(c)
+    good.sort(key=lambda c: c["score"], reverse=True)
     return good
 
 
