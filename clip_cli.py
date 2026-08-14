@@ -44,17 +44,20 @@ def parse_ts(value: str) -> int:
 
 
 def resolve_source(src: str) -> Path:
-    """Return a local file path: download if it's a URL, else use as-is."""
+    """Return a local file path: download if it's a URL, else use as-is.
+
+    yt-dlp's Drive extractor handles Google Drive share links the same way
+    as YouTube ones, so a campaign doc mixing YouTube + Drive links works
+    through this same path with no special-casing."""
     if src.startswith("http://") or src.startswith("https://"):
         from video import sources
         log.info("Downloading source video…")
-        # extract the id via yt-dlp's own resolution by downloading directly
         out = sources.DOWNLOADS
         out.mkdir(parents=True, exist_ok=True)
         import subprocess
         target = out / "cli_source.mp4"
-        cmd = ["yt-dlp", *sources.cookie_args(), "-f",
-               "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        cmd = ["yt-dlp", *sources.cookie_args(), *sources.proxy_args(), "-f",
+               "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b/best",
                "--merge-output-format", "mp4", "-o", str(target), src]
         if subprocess.run(cmd).returncode != 0 or not target.exists():
             log.error("download failed")

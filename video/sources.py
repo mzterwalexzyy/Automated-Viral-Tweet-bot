@@ -28,6 +28,16 @@ def cookie_args() -> list[str]:
     return ["--cookies", path] if path and Path(path).exists() else []
 
 
+# Datacenter IPs (Oracle, AWS, etc.) get flagged by ASN regardless of cookies.
+# Route through a rotating residential proxy instead: YT_PROXY as a full URL,
+# e.g. http://user:pass@proxy-host:port (get this from Webshare/IPRoyal/etc.
+# "rotating residential" plan — NOT a static/dedicated IP, since a fixed IP
+# hammered by automated downloads can build its own bot reputation over time).
+def proxy_args() -> list[str]:
+    proxy = os.getenv("YT_PROXY")
+    return ["--proxy", proxy] if proxy else []
+
+
 def _load_seen() -> set[str]:
     if SEEN_FILE.exists():
         return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
@@ -43,7 +53,7 @@ def list_recent_video_ids(channel_url: str, limit: int = 5) -> list[str]:
     """Return the newest `limit` video IDs for a channel/playlist URL."""
     cmd = [
         "yt-dlp", "--flat-playlist", "--playlist-end", str(limit),
-        *cookie_args(), "--print", "%(id)s", channel_url,
+        *cookie_args(), *proxy_args(), "--print", "%(id)s", channel_url,
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
@@ -58,7 +68,7 @@ def download_video(video_id: str) -> Path | None:
     out_tmpl = str(DOWNLOADS / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
-        *cookie_args(),
+        *cookie_args(), *proxy_args(),
         "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "--merge-output-format", "mp4",
         "-o", out_tmpl,
