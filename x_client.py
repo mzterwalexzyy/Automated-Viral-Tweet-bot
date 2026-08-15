@@ -58,3 +58,9 @@ def post_reply(text: str, reply_to_id: str) -> str:
     """Reply to a tweet. Returns the new tweet id."""
     resp = get_client().create_tweet(text=text, in_reply_to_tweet_id=reply_to_id)
     return resp.data["id"]
+
+
+def post_quote(text: str, quoted_tweet_id: str) -> str:
+    """Quote-tweet a post with original commentary. Returns the new tweet id."""
+    resp = get_client().create_tweet(text=text, quote_tweet_id=quoted_tweet_id)
+    return resp.data["id"]

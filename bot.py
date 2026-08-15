@@ -28,8 +28,10 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from generator import generate_tweet
 from replies import generate_reply
-from watchlist import fetch_watched_accounts, trending_context, reply_candidates
-from x_client import post_tweet, post_video, post_reply, tweet_url
+from quotes import generate_quote
+from watchlist import (fetch_watched_accounts, trending_context,
+                       reply_candidates, quote_candidates)
+from x_client import post_tweet, post_video, post_reply, post_quote, tweet_url
 from video.pipeline import make_clips, DEFAULT_CHANNELS
 from video.clipper import build_caption, build_ft
 
@@ -59,6 +61,10 @@ DEFAULT_STATE = {
     "replied": [],          # tweet ids already replied to (dedup)
     "reply_skipped": [],    # tweet ids explicitly skipped (dedup, don't re-offer)
     "reply_styles": [],     # example REAL human replies whose voice to emulate
+    "quote_drafts": {},     # quote_id -> {handle, tweet_id, original, text}
+    "quoted": [],           # tweet ids already quote-tweeted (dedup)
+    "quote_skipped": [],    # tweet ids explicitly skipped (dedup, don't re-offer)
+    "quote_styles": [],     # example real quote-tweets whose voice to emulate
 }
 
 
@@ -193,6 +199,126 @@ async def cmd_replystyle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         f"{len(STATE['reply_styles'])} reply-style examples saved. "
         "Usage: /replystyle <real reply you like> or /replystyle clear")
+
+
+async def send_quote_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text: str) -> None:
+    """Send a quote-tweet draft to Telegram: original post + proposed quote + buttons.
+
+    Human-reviewed for the same reason replies are: a new account posting
+    unsupervised bulk content is exactly what X's automation rules flag."""
+    quote_id = str(STATE["next_id"])
+    STATE["next_id"] += 1
+    STATE["quote_drafts"][quote_id] = {
+        "handle": cand["handle"], "tweet_id": cand["id"],
+        "original": cand["text"], "text": text,
+    }
+    save_state(STATE)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Post quote", callback_data=f"quotex:{quote_id}"),
+        InlineKeyboardButton("🔄 Redo", callback_data=f"quoteredo:{quote_id}"),
+        InlineKeyboardButton("❌ Skip", callback_data=f"quoteskip:{quote_id}"),
+    ]])
+    await context.bot.send_message(
+        CHAT_ID,
+        f"🔁 Quote @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
+        f"↳ Draft: {text}",
+        reply_markup=kb)
+
+
+async def cmd_quotenow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Draft quote-tweets for fresh controversial posts, for review.
+
+    Usage: /quotenow [n] (default 3). Same cache as /watch, zero extra reads."""
+    if not authorized(update):
+        return
+    n = 3
+    if context.args:
+        try:
+            n = max(1, min(10, int(context.args[0])))
+        except ValueError:
+            pass
+    candidates = quote_candidates(STATE, limit=n)
+    if not candidates:
+        await update.message.reply_text(
+            "No fresh posts to quote. Run /watch with some niche accounts "
+            "first (or wait for the daily refresh).")
+        return
+    await update.message.reply_text(f"Checking {len(candidates)} posts for quote-worthiness…")
+    sent = 0
+    for cand in candidates:
+        try:
+            text = await asyncio.to_thread(
+                generate_quote, cand["text"], STATE["quote_styles"])
+        except Exception as e:
+            log.exception("quote generation failed")
+            await update.message.reply_text(f"⚠️ Quote generation failed: {e}")
+            continue
+        if text is None:
+            STATE["quote_skipped"] = (STATE["quote_skipped"] + [cand["id"]])[-200:]
+            save_state(STATE)
+            continue
+        await send_quote_draft(context, cand, text)
+        sent += 1
+    if not sent:
+        await update.message.reply_text("None of those were controversial/engaging enough to quote.")
+
+
+async def cmd_quotestyle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a REAL human quote-tweet example to emulate: /quotestyle <text>."""
+    if not authorized(update):
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if text == "clear":
+        STATE["quote_styles"] = []
+    elif text:
+        STATE["quote_styles"] = (STATE["quote_styles"] + [text])[-10:]
+    save_state(STATE)
+    await update.message.reply_text(
+        f"{len(STATE['quote_styles'])} quote-style examples saved. "
+        "Usage: /quotestyle <real quote-tweet you like> or /quotestyle clear")
+
+
+async def scheduled_reply(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One reply draft per tick, spread through the day. Silent if no fresh
+    candidates (doesn't spam the chat 20x/day when the cache is stale)."""
+    if STATE["paused"]:
+        return
+    candidates = reply_candidates(STATE, limit=1)
+    if not candidates:
+        return
+    cand = candidates[0]
+    try:
+        text = await asyncio.to_thread(generate_reply, cand["text"], STATE["reply_styles"])
+    except Exception as e:
+        log.exception("scheduled reply generation failed")
+        await context.bot.send_message(CHAT_ID, f"⚠️ Reply generation failed: {e}")
+        return
+    if text is None:
+        STATE["reply_skipped"] = (STATE["reply_skipped"] + [cand["id"]])[-200:]
+        save_state(STATE)
+        return
+    await send_reply_draft(context, cand, text)
+
+
+async def scheduled_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One quote-tweet draft per tick, spread through the day."""
+    if STATE["paused"]:
+        return
+    candidates = quote_candidates(STATE, limit=1)
+    if not candidates:
+        return
+    cand = candidates[0]
+    try:
+        text = await asyncio.to_thread(generate_quote, cand["text"], STATE["quote_styles"])
+    except Exception as e:
+        log.exception("scheduled quote generation failed")
+        await context.bot.send_message(CHAT_ID, f"⚠️ Quote generation failed: {e}")
+        return
+    if text is None:
+        STATE["quote_skipped"] = (STATE["quote_skipped"] + [cand["id"]])[-200:]
+        save_state(STATE)
+        return
+    await send_quote_draft(context, cand, text)
 
 
 async def scheduled_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -354,6 +480,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/channels <urls> – set YouTube source channels\n"
         "/warmup [n] – draft replies to fresh posts from /watch accounts (review before posting)\n"
         "/replystyle <real reply> – teach the reply voice from real human examples\n"
+        "/quotenow [n] – draft quote-tweets for controversial/engaging posts\n"
+        "/quotestyle <real quote-tweet> – teach the quote voice from real examples\n"
+        "(replies + quotes also auto-draft on a schedule — REPLIES_PER_DAY/"
+        "QUOTES_PER_DAY in .env, default 20/3)\n"
         "/pause /resume /status"
     )
 
@@ -612,6 +742,51 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_text("❌ Reply skipped.")
         return
 
+    # ----- quote-tweet actions -----
+    if action.startswith("quote"):
+        draft = STATE["quote_drafts"].get(ident)
+        if draft is None:
+            await q.edit_message_text("(quote expired)")
+            return
+        if action == "quotex":
+            try:
+                await q.edit_message_text("Posting quote…")
+            except Exception:
+                pass
+            try:
+                quote_id = await asyncio.to_thread(
+                    post_quote, draft["text"], draft["tweet_id"])
+                STATE["quoted"] = (STATE["quoted"] + [draft["tweet_id"]])[-500:]
+                STATE["quote_drafts"].pop(ident, None)
+                save_state(STATE)
+                await context.bot.send_message(
+                    CHAT_ID, f"🚀 Quote posted: {tweet_url(quote_id)}")
+            except Exception as e:
+                log.exception("quote post failed")
+                await context.bot.send_message(CHAT_ID, f"⚠️ Quote post failed: {e}")
+        elif action == "quoteredo":
+            await q.edit_message_text("Regenerating…")
+            try:
+                new_text = await asyncio.to_thread(
+                    generate_quote, draft["original"], STATE["quote_styles"])
+            except Exception as e:
+                await context.bot.send_message(CHAT_ID, f"⚠️ Generation failed: {e}")
+                return
+            STATE["quote_drafts"].pop(ident, None)
+            save_state(STATE)
+            if new_text is None:
+                await context.bot.send_message(CHAT_ID, "Model chose to skip this one.")
+                return
+            cand = {"handle": draft["handle"], "id": draft["tweet_id"],
+                   "text": draft["original"]}
+            await send_quote_draft(context, cand, new_text)
+        else:  # quoteskip
+            STATE["quote_skipped"] = (STATE["quote_skipped"] + [draft["tweet_id"]])[-200:]
+            STATE["quote_drafts"].pop(ident, None)
+            save_state(STATE)
+            await q.edit_message_text("❌ Quote skipped.")
+        return
+
     # ----- text draft actions -----
     draft_id = ident
     text = STATE["drafts"].pop(draft_id, None)
@@ -654,6 +829,8 @@ def main() -> None:
     app.add_handler(CommandHandler("channels", cmd_channels))
     app.add_handler(CommandHandler("warmup", cmd_warmup))
     app.add_handler(CommandHandler("replystyle", cmd_replystyle))
+    app.add_handler(CommandHandler("quotenow", cmd_quotenow))
+    app.add_handler(CommandHandler("quotestyle", cmd_quotestyle))
     app.add_handler(CallbackQueryHandler(on_button))
     # plain-text replies (speaker names) — must be last so commands take priority
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -661,14 +838,27 @@ def main() -> None:
     # Refresh trend data shortly before the first draft of the day
     app.job_queue.run_daily(refresh_watchlist, time=dtime(8, 30))
 
-    # Spread N drafts/day across 9:00–21:00
-    n = max(1, int(os.getenv("DRAFTS_PER_DAY", "4")))
-    span_minutes = 12 * 60
-    for i in range(n):
-        minutes = int(9 * 60 + i * span_minutes / n)
-        app.job_queue.run_daily(scheduled_draft, time=dtime(minutes // 60, minutes % 60))
+    def _spread(job, count: int, start_h: int, end_h: int) -> None:
+        span_minutes = (end_h - start_h) * 60
+        for i in range(count):
+            minutes = int(start_h * 60 + i * span_minutes / count)
+            app.job_queue.run_daily(job, time=dtime(minutes // 60, minutes % 60))
 
-    log.info("Bot starting; %d scheduled drafts/day", n)
+    # Spread N drafts/day across 9:00-21:00
+    n = max(1, int(os.getenv("DRAFTS_PER_DAY", "4")))
+    _spread(scheduled_draft, n, 9, 21)
+
+    # Spread replies/quotes across 8:00-22:00 (a wider window helps replies
+    # not all land at the same few minutes every day, which reads as scripted)
+    n_replies = max(0, int(os.getenv("REPLIES_PER_DAY", "20")))
+    if n_replies:
+        _spread(scheduled_reply, n_replies, 8, 22)
+    n_quotes = max(0, int(os.getenv("QUOTES_PER_DAY", "3")))
+    if n_quotes:
+        _spread(scheduled_quote, n_quotes, 8, 22)
+
+    log.info("Bot starting; %d drafts/day, %d replies/day, %d quotes/day",
+             n, n_replies, n_quotes)
     app.run_polling()
 
 

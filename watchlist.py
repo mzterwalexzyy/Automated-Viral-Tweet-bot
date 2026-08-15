@@ -65,21 +65,38 @@ def trending_context(state: dict) -> list[str]:
     return tweets
 
 
-def reply_candidates(state: dict, limit: int = 5) -> list[dict]:
-    """Cached posts from watched accounts not yet replied to (or skipped).
-
-    Returns [{"handle": str, "id": str, "text": str}, ...], newest-cached
-    accounts first, skipping anything in state['replied']/state['reply_skipped'].
-    """
-    seen = set(state.get("replied", [])) | set(state.get("reply_skipped", []))
+def _candidates(state: dict, seen_keys: list[str], limit: int) -> list[dict]:
+    """Cached posts not yet used (per seen_keys), interleaved round-robin
+    across accounts so repeated small pulls (e.g. limit=1 from a scheduler)
+    rotate through different accounts instead of draining one handle first."""
+    seen: set[str] = set()
+    for key in seen_keys:
+        seen |= set(state.get(key, []))
+    per_handle = {
+        handle: [t for t in entry.get("tweets", [])
+                if isinstance(t, dict) and t["id"] not in seen]
+        for handle, entry in state.get("watch_cache", {}).items()
+    }
     out = []
-    for handle, entry in state.get("watch_cache", {}).items():
-        for t in entry.get("tweets", []):
-            if not isinstance(t, dict):
-                continue  # old-format cache entry, no id to reply to
-            if t["id"] in seen:
+    while len(out) < limit and any(per_handle.values()):
+        for handle, tweets in per_handle.items():
+            if not tweets:
                 continue
+            t = tweets.pop(0)
             out.append({"handle": handle, "id": t["id"], "text": t["text"]})
             if len(out) >= limit:
-                return out
+                break
     return out
+
+
+def reply_candidates(state: dict, limit: int = 5) -> list[dict]:
+    """Cached posts from watched accounts not yet replied to or skipped,
+    interleaved round-robin across accounts. See _candidates()."""
+    return _candidates(state, ["replied", "reply_skipped"], limit)
+
+
+def quote_candidates(state: dict, limit: int = 5) -> list[dict]:
+    """Cached posts not yet quote-tweeted or skipped, interleaved round-robin
+    across accounts. Separate dedup set from replies — a post can be both
+    replied to AND quote-tweeted, they're different engagement actions."""
+    return _candidates(state, ["quoted", "quote_skipped"], limit)
