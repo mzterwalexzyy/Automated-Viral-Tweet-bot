@@ -490,24 +490,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "⚠️ Couldn't fetch that post (private, deleted, or invalid link).")
             return
         cand = {"handle": tweet["handle"], "id": tweet["id"], "text": tweet["text"]}
-        try:
-            reply_text = await asyncio.to_thread(
-                generate_reply, tweet["text"], STATE["reply_styles"])
-        except Exception as e:
-            log.exception("reply generation failed")
-            reply_text = None
-            await update.message.reply_text(f"⚠️ Reply generation failed: {e}")
-        if reply_text:
-            await send_reply_draft(context, cand, reply_text)
-        try:
-            quote_text = await asyncio.to_thread(
-                generate_quote, tweet["text"], STATE["quote_styles"])
-        except Exception as e:
-            log.exception("quote generation failed")
-            quote_text = None
-            await update.message.reply_text(f"⚠️ Quote generation failed: {e}")
-        if quote_text:
-            await send_quote_draft(context, cand, quote_text)
+        # Run reply + quote generation concurrently (each is a slow LLM call,
+        # up to ~30-45s on some providers) rather than back-to-back, so a
+        # single pasted link takes ~max(reply, quote) instead of their sum.
+        reply_result, quote_result = await asyncio.gather(
+            asyncio.to_thread(generate_reply, tweet["text"], STATE["reply_styles"]),
+            asyncio.to_thread(generate_quote, tweet["text"], STATE["quote_styles"]),
+            return_exceptions=True,
+        )
+        if isinstance(reply_result, Exception):
+            log.exception("reply generation failed", exc_info=reply_result)
+            await update.message.reply_text(f"⚠️ Reply generation failed: {reply_result}")
+        elif reply_result:
+            await send_reply_draft(context, cand, reply_result)
+        if isinstance(quote_result, Exception):
+            log.exception("quote generation failed", exc_info=quote_result)
+            await update.message.reply_text(f"⚠️ Quote generation failed: {quote_result}")
+        elif quote_result:
+            await send_quote_draft(context, cand, quote_result)
         elif quote_text is None and reply_text is not None:
             await update.message.reply_text("(not controversial enough to quote)")
 
@@ -896,7 +896,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    # concurrent_updates: without this, python-telegram-bot processes updates
+    # one at a time - a second pasted link would sit silently queued behind
+    # the first one's ~30-60s LLM calls instead of starting immediately.
+    app = (Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"])
+          .concurrent_updates(8).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("post", cmd_post))
