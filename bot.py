@@ -138,12 +138,9 @@ async def send_reply_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text:
         "original": cand["text"], "text": text, "message_id": None,
     }
     save_state(STATE)
-    kb = _draft_keyboard("reply", reply_id)
-    msg = await context.bot.send_message(
-        CHAT_ID,
-        f"💬 Reply to @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
-        f"↳ Draft: {text}",
-        reply_markup=kb)
+    kb = _draft_keyboard("reply", reply_id, cand["id"])
+    body = _format_draft_body("💬", "Reply", cand["handle"], cand["text"], text)
+    msg = await context.bot.send_message(CHAT_ID, body, reply_markup=kb, parse_mode="Markdown")
     STATE["reply_drafts"][reply_id]["message_id"] = msg.message_id
     save_state(STATE)
 
@@ -184,16 +181,19 @@ async def cmd_warmup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_replystyle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a REAL human reply example to emulate: /replystyle <text>.
+    """Add a REAL human reply example to emulate: /replystyle <text or link>.
 
     This is the few-shot 'training' mechanism: paste actual replies you like
     from real people in your niche and future drafts will match that voice."""
     if not authorized(update):
         return
-    text = update.message.text.partition(" ")[2].strip()
-    if text == "clear":
+    raw = update.message.text.partition(" ")[2].strip()
+    if raw == "clear":
         STATE["reply_styles"] = []
-    elif text:
+    elif raw:
+        text = await _resolve_example(update, raw)
+        if text is None:
+            return
         STATE["reply_styles"] = (STATE["reply_styles"] + [text])[-10:]
     save_state(STATE)
     await update.message.reply_text(
@@ -213,12 +213,9 @@ async def send_quote_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text:
         "original": cand["text"], "text": text, "message_id": None,
     }
     save_state(STATE)
-    kb = _draft_keyboard("quote", quote_id)
-    msg = await context.bot.send_message(
-        CHAT_ID,
-        f"🔁 Quote @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
-        f"↳ Draft: {text}",
-        reply_markup=kb)
+    kb = _draft_keyboard("quote", quote_id, cand["id"])
+    body = _format_draft_body("🔁", "Quote", cand["handle"], cand["text"], text)
+    msg = await context.bot.send_message(CHAT_ID, body, reply_markup=kb, parse_mode="Markdown")
     STATE["quote_drafts"][quote_id]["message_id"] = msg.message_id
     save_state(STATE)
 
@@ -262,13 +259,16 @@ async def cmd_quotenow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_quotestyle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a REAL human quote-tweet example to emulate: /quotestyle <text>."""
+    """Add a REAL human quote-tweet example to emulate: /quotestyle <text or link>."""
     if not authorized(update):
         return
-    text = update.message.text.partition(" ")[2].strip()
-    if text == "clear":
+    raw = update.message.text.partition(" ")[2].strip()
+    if raw == "clear":
         STATE["quote_styles"] = []
-    elif text:
+    elif raw:
+        text = await _resolve_example(update, raw)
+        if text is None:
+            return
         STATE["quote_styles"] = (STATE["quote_styles"] + [text])[-10:]
     save_state(STATE)
     await update.message.reply_text(
@@ -405,12 +405,33 @@ async def finalize_clip(context: ContextTypes.DEFAULT_TYPE, clip_id: str,
     await context.bot.send_message(CHAT_ID, text, reply_markup=kb)
 
 
-def _draft_keyboard(kind: str, draft_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Post", callback_data=f"{kind}x:{draft_id}"),
-        InlineKeyboardButton("✏️ Edit", callback_data=f"{kind}edit:{draft_id}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"{kind}skip:{draft_id}"),
-    ]])
+def _md_escape(s: str) -> str:
+    """Escape legacy-Markdown special chars in plain (non-code) text."""
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _code_block(s: str) -> str:
+    """Wrap text in a Markdown code block (tap-to-copy in Telegram), safe
+    against literal backticks breaking the fence early."""
+    return "```\n" + s.replace("`", "'") + "\n```"
+
+
+def _format_draft_body(emoji: str, label: str, handle: str, original: str, text: str) -> str:
+    orig = _md_escape(original[:200])
+    h = _md_escape(handle)
+    return f"{emoji} {label} to @{h}:\n\"{orig}\"\n\n↳ Draft (tap to copy):\n{_code_block(text)}"
+
+
+def _draft_keyboard(kind: str, draft_id: str, tweet_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Post", callback_data=f"{kind}x:{draft_id}"),
+         InlineKeyboardButton("✏️ Edit", callback_data=f"{kind}edit:{draft_id}"),
+         InlineKeyboardButton("❌ Reject", callback_data=f"{kind}skip:{draft_id}")],
+        [InlineKeyboardButton("🔗 Open post to paste manually",
+                              url=f"https://x.com/i/status/{tweet_id}")],
+    ])
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -438,18 +459,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(STATE)
         label = "Reply" if kind == "reply" else "Quote"
         emoji = "💬" if kind == "reply" else "🔁"
-        new_body = (f"{emoji} {label} to @{draft['handle']}:\n"
-                   f"\"{draft['original'][:200]}\"\n\n↳ Draft: {raw}")
+        new_body = _format_draft_body(emoji, label, draft["handle"], draft["original"], raw)
+        kb = _draft_keyboard(kind, draft_id, draft["tweet_id"])
         if draft.get("message_id"):
             try:
                 await context.bot.edit_message_text(
                     chat_id=CHAT_ID, message_id=draft["message_id"],
-                    text=new_body, reply_markup=_draft_keyboard(kind, draft_id))
+                    text=new_body, reply_markup=kb, parse_mode="Markdown")
                 return
             except Exception:
                 pass  # original message gone/too old to edit; fall through
-        await update.message.reply_text(
-            f"Updated:\n\n{new_body}", reply_markup=_draft_keyboard(kind, draft_id))
+        await update.message.reply_text(new_body, reply_markup=kb, parse_mode="Markdown")
         return
 
     clip_id = STATE.get("awaiting_names")
@@ -667,19 +687,36 @@ async def cmd_inspo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Saved ({len(STATE['inspo'])} inspo posts).")
 
 
+async def _resolve_example(update: Update, raw: str) -> str | None:
+    """Accept either a pasted tweet URL (resolved via oembed, no read-API
+    needed) or literal pasted text. Returns None if resolution failed."""
+    url = oembed.find_tweet_url(raw)
+    if not url:
+        return raw
+    tweet = await asyncio.to_thread(oembed.fetch_tweet, url)
+    if tweet is None:
+        await update.message.reply_text(
+            "⚠️ Couldn't fetch that link (private, deleted, or invalid).")
+        return None
+    return tweet["text"]
+
+
 async def cmd_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add an example tweet whose voice to emulate: /style <text>."""
+    """Add an example tweet whose voice to emulate: /style <text or link>."""
     if not authorized(update):
         return
-    text = update.message.text.partition(" ")[2].strip()
-    if text == "clear":
+    raw = update.message.text.partition(" ")[2].strip()
+    if raw == "clear":
         STATE["styles"] = []
-    elif text:
+    elif raw:
+        text = await _resolve_example(update, raw)
+        if text is None:
+            return
         STATE["styles"] = (STATE["styles"] + [text])[-10:]
     save_state(STATE)
     await update.message.reply_text(
         f"{len(STATE['styles'])} style examples saved. "
-        "Usage: /style <example tweet> or /style clear")
+        "Usage: /style <example tweet or link> or /style clear")
 
 
 async def cmd_template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
