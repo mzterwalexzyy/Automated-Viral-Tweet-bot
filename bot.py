@@ -26,6 +26,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+import oembed
 from generator import generate_tweet
 from replies import generate_reply
 from quotes import generate_quote
@@ -56,6 +57,7 @@ DEFAULT_STATE = {
     "channels": list(DEFAULT_CHANNELS),  # YouTube sources for clipping
     "clips": {},           # clip_id -> clip job dict (pending review)
     "awaiting_names": None,  # clip_id currently awaiting speaker-name reply
+    "awaiting_edit": None,  # {"kind": "reply"|"quote", "id": draft_id} awaiting typed edit
     "handle": os.getenv("X_HANDLE", ""),  # watermark handle, e.g. @yourname
     "reply_drafts": {},     # reply_id -> {handle, tweet_id, original, text}
     "replied": [],          # tweet ids already replied to (dedup)
@@ -133,19 +135,17 @@ async def send_reply_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text:
     STATE["next_id"] += 1
     STATE["reply_drafts"][reply_id] = {
         "handle": cand["handle"], "tweet_id": cand["id"],
-        "original": cand["text"], "text": text,
+        "original": cand["text"], "text": text, "message_id": None,
     }
     save_state(STATE)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Post reply", callback_data=f"replyx:{reply_id}"),
-        InlineKeyboardButton("🔄 Redo", callback_data=f"replyredo:{reply_id}"),
-        InlineKeyboardButton("❌ Skip", callback_data=f"replyskip:{reply_id}"),
-    ]])
-    await context.bot.send_message(
+    kb = _draft_keyboard("reply", reply_id)
+    msg = await context.bot.send_message(
         CHAT_ID,
         f"💬 Reply to @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
         f"↳ Draft: {text}",
         reply_markup=kb)
+    STATE["reply_drafts"][reply_id]["message_id"] = msg.message_id
+    save_state(STATE)
 
 
 async def cmd_warmup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -210,19 +210,17 @@ async def send_quote_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text:
     STATE["next_id"] += 1
     STATE["quote_drafts"][quote_id] = {
         "handle": cand["handle"], "tweet_id": cand["id"],
-        "original": cand["text"], "text": text,
+        "original": cand["text"], "text": text, "message_id": None,
     }
     save_state(STATE)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Post quote", callback_data=f"quotex:{quote_id}"),
-        InlineKeyboardButton("🔄 Redo", callback_data=f"quoteredo:{quote_id}"),
-        InlineKeyboardButton("❌ Skip", callback_data=f"quoteskip:{quote_id}"),
-    ]])
-    await context.bot.send_message(
+    kb = _draft_keyboard("quote", quote_id)
+    msg = await context.bot.send_message(
         CHAT_ID,
         f"🔁 Quote @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
         f"↳ Draft: {text}",
         reply_markup=kb)
+    STATE["quote_drafts"][quote_id]["message_id"] = msg.message_id
+    save_state(STATE)
 
 
 async def cmd_quotenow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -407,19 +405,91 @@ async def finalize_clip(context: ContextTypes.DEFAULT_TYPE, clip_id: str,
     await context.bot.send_message(CHAT_ID, text, reply_markup=kb)
 
 
+def _draft_keyboard(kind: str, draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Post", callback_data=f"{kind}x:{draft_id}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"{kind}edit:{draft_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"{kind}skip:{draft_id}"),
+    ]])
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch speaker-name replies when a clip is awaiting them."""
+    """Handles, in order: a typed edit for a pending reply/quote draft, a
+    speaker-name reply for a clip awaiting them, or a pasted tweet URL
+    (auto-drafts a reply + quote for review, no X read-API access needed —
+    resolved via oembed.py's public oEmbed lookup)."""
     if not authorized(update):
         return
+    if not update.message or not update.message.text:
+        return
+    raw = update.message.text.strip()
+
+    edit = STATE.get("awaiting_edit")
+    if edit:
+        kind, draft_id = edit["kind"], edit["id"]
+        store = STATE["reply_drafts"] if kind == "reply" else STATE["quote_drafts"]
+        draft = store.get(draft_id)
+        STATE["awaiting_edit"] = None
+        if draft is None:
+            save_state(STATE)
+            await update.message.reply_text("(that draft expired)")
+            return
+        draft["text"] = raw
+        save_state(STATE)
+        label = "Reply" if kind == "reply" else "Quote"
+        emoji = "💬" if kind == "reply" else "🔁"
+        new_body = (f"{emoji} {label} to @{draft['handle']}:\n"
+                   f"\"{draft['original'][:200]}\"\n\n↳ Draft: {raw}")
+        if draft.get("message_id"):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=CHAT_ID, message_id=draft["message_id"],
+                    text=new_body, reply_markup=_draft_keyboard(kind, draft_id))
+                return
+            except Exception:
+                pass  # original message gone/too old to edit; fall through
+        await update.message.reply_text(
+            f"Updated:\n\n{new_body}", reply_markup=_draft_keyboard(kind, draft_id))
+        return
+
     clip_id = STATE.get("awaiting_names")
-    if not clip_id or not update.message or not update.message.text:
+    if clip_id:
+        if "|" not in raw:
+            await update.message.reply_text("Send two names separated by |  e.g. Obama | Bartlett")
+            return
+        name1, _, name2 = raw.partition("|")
+        await finalize_clip(context, clip_id, name1.strip(), name2.strip())
         return
-    raw = update.message.text
-    if "|" not in raw:
-        await update.message.reply_text("Send two names separated by |  e.g. Obama | Bartlett")
-        return
-    name1, _, name2 = raw.partition("|")
-    await finalize_clip(context, clip_id, name1.strip(), name2.strip())
+
+    url = oembed.find_tweet_url(raw)
+    if url:
+        await update.message.reply_text("Fetching post…")
+        tweet = await asyncio.to_thread(oembed.fetch_tweet, url)
+        if tweet is None:
+            await update.message.reply_text(
+                "⚠️ Couldn't fetch that post (private, deleted, or invalid link).")
+            return
+        cand = {"handle": tweet["handle"], "id": tweet["id"], "text": tweet["text"]}
+        try:
+            reply_text = await asyncio.to_thread(
+                generate_reply, tweet["text"], STATE["reply_styles"])
+        except Exception as e:
+            log.exception("reply generation failed")
+            reply_text = None
+            await update.message.reply_text(f"⚠️ Reply generation failed: {e}")
+        if reply_text:
+            await send_reply_draft(context, cand, reply_text)
+        try:
+            quote_text = await asyncio.to_thread(
+                generate_quote, tweet["text"], STATE["quote_styles"])
+        except Exception as e:
+            log.exception("quote generation failed")
+            quote_text = None
+            await update.message.reply_text(f"⚠️ Quote generation failed: {e}")
+        if quote_text:
+            await send_quote_draft(context, cand, quote_text)
+        elif quote_text is None and reply_text is not None:
+            await update.message.reply_text("(not controversial enough to quote)")
 
 
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -719,22 +789,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 log.exception("reply post failed")
                 await context.bot.send_message(CHAT_ID, f"⚠️ Reply post failed: {e}")
-        elif action == "replyredo":
-            await q.edit_message_text("Regenerating…")
-            try:
-                new_text = await asyncio.to_thread(
-                    generate_reply, draft["original"], STATE["reply_styles"])
-            except Exception as e:
-                await context.bot.send_message(CHAT_ID, f"⚠️ Generation failed: {e}")
-                return
-            STATE["reply_drafts"].pop(ident, None)
+        elif action == "replyedit":
+            STATE["awaiting_edit"] = {"kind": "reply", "id": ident}
             save_state(STATE)
-            if new_text is None:
-                await context.bot.send_message(CHAT_ID, "Model chose to skip this one.")
-                return
-            cand = {"handle": draft["handle"], "id": draft["tweet_id"],
-                   "text": draft["original"]}
-            await send_reply_draft(context, cand, new_text)
+            await context.bot.send_message(
+                CHAT_ID, "✏️ Send the edited reply text now.")
         else:  # replyskip
             STATE["reply_skipped"] = (STATE["reply_skipped"] + [draft["tweet_id"]])[-200:]
             STATE["reply_drafts"].pop(ident, None)
@@ -764,22 +823,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 log.exception("quote post failed")
                 await context.bot.send_message(CHAT_ID, f"⚠️ Quote post failed: {e}")
-        elif action == "quoteredo":
-            await q.edit_message_text("Regenerating…")
-            try:
-                new_text = await asyncio.to_thread(
-                    generate_quote, draft["original"], STATE["quote_styles"])
-            except Exception as e:
-                await context.bot.send_message(CHAT_ID, f"⚠️ Generation failed: {e}")
-                return
-            STATE["quote_drafts"].pop(ident, None)
+        elif action == "quoteedit":
+            STATE["awaiting_edit"] = {"kind": "quote", "id": ident}
             save_state(STATE)
-            if new_text is None:
-                await context.bot.send_message(CHAT_ID, "Model chose to skip this one.")
-                return
-            cand = {"handle": draft["handle"], "id": draft["tweet_id"],
-                   "text": draft["original"]}
-            await send_quote_draft(context, cand, new_text)
+            await context.bot.send_message(
+                CHAT_ID, "✏️ Send the edited quote text now.")
         else:  # quoteskip
             STATE["quote_skipped"] = (STATE["quote_skipped"] + [draft["tweet_id"]])[-200:]
             STATE["quote_drafts"].pop(ident, None)
