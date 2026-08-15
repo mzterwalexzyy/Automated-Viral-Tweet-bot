@@ -87,6 +87,7 @@ Write:
    just one word of it.
 5. "handles": array of @handles to tag, ONLY if a show/person is explicitly
    named in the excerpt. Empty array otherwise — never guess.
+6. No em dashes anywhere. Use commas, periods, or "and"/"but" instead.
 
 Return STRICT JSON only, no prose:
 {"hook": "...", "intro": "...", "summary": "...",
@@ -145,6 +146,10 @@ def pick_moments(transcript_text: str, max_clips: int = 4,
     return good
 
 
+def _no_em_dash(s: str) -> str:
+    return s.replace("—", ", ").replace("–", "-") if isinstance(s, str) else s
+
+
 def caption_for(excerpt_text: str, style_examples: list[str] | None = None) -> dict:
     """Step 2: write the caption strictly from the real excerpt text."""
     style = ""
@@ -156,10 +161,18 @@ def caption_for(excerpt_text: str, style_examples: list[str] | None = None) -> d
                    max_tokens=1200, temperature=0.5).strip()
     raw = raw[raw.find("{"): raw.rfind("}") + 1]
     try:
-        return json.loads(raw)
+        cap = json.loads(raw)
     except json.JSONDecodeError as e:
         log.error("caption JSON parse failed: %s\n%s", e, raw[:500])
         return {}
+    # hard safety net: strip em/en dashes regardless of prompt compliance
+    for key in ("hook", "intro", "summary"):
+        if key in cap:
+            cap[key] = _no_em_dash(cap[key])
+    for turn in cap.get("dialogue") or []:
+        if isinstance(turn, dict) and "text" in turn:
+            turn["text"] = _no_em_dash(turn["text"])
+    return cap
 
 
 DEFAULT_MIN_SCORE = 75

@@ -27,7 +27,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
 from generator import generate_tweet
-from watchlist import fetch_watched_accounts, trending_context
+from replies import generate_reply
+from watchlist import fetch_watched_accounts, trending_context, reply_candidates
 from x_client import post_tweet, post_video, post_reply, tweet_url
 from video.pipeline import make_clips, DEFAULT_CHANNELS
 from video.clipper import build_caption, build_ft
@@ -54,6 +55,10 @@ DEFAULT_STATE = {
     "clips": {},           # clip_id -> clip job dict (pending review)
     "awaiting_names": None,  # clip_id currently awaiting speaker-name reply
     "handle": os.getenv("X_HANDLE", ""),  # watermark handle, e.g. @yourname
+    "reply_drafts": {},     # reply_id -> {handle, tweet_id, original, text}
+    "replied": [],          # tweet ids already replied to (dedup)
+    "reply_skipped": [],    # tweet ids explicitly skipped (dedup, don't re-offer)
+    "reply_styles": [],     # example REAL human replies whose voice to emulate
 }
 
 
@@ -110,6 +115,84 @@ async def refresh_watchlist(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(CHAT_ID, "⚠️ Watchlist:\n" + "\n".join(errors))
     if refreshed:
         log.info("Refreshed %d watched accounts", refreshed)
+
+
+async def send_reply_draft(context: ContextTypes.DEFAULT_TYPE, cand: dict, text: str) -> None:
+    """Send a reply draft to Telegram: original post + proposed reply + buttons.
+
+    Account warm-up is deliberately human-reviewed, not auto-posted — a brand
+    new account posting bulk/templated replies is exactly what X's automation
+    rules flag, so every reply here needs an explicit tap before it goes out."""
+    reply_id = str(STATE["next_id"])
+    STATE["next_id"] += 1
+    STATE["reply_drafts"][reply_id] = {
+        "handle": cand["handle"], "tweet_id": cand["id"],
+        "original": cand["text"], "text": text,
+    }
+    save_state(STATE)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Post reply", callback_data=f"replyx:{reply_id}"),
+        InlineKeyboardButton("🔄 Redo", callback_data=f"replyredo:{reply_id}"),
+        InlineKeyboardButton("❌ Skip", callback_data=f"replyskip:{reply_id}"),
+    ]])
+    await context.bot.send_message(
+        CHAT_ID,
+        f"💬 Reply to @{cand['handle']}:\n\"{cand['text'][:200]}\"\n\n"
+        f"↳ Draft: {text}",
+        reply_markup=kb)
+
+
+async def cmd_warmup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Draft replies to fresh posts from watched (niche) accounts, for review.
+
+    Usage: /warmup [n]  (default 3). Pulls from the same cache /watch builds,
+    so it costs zero extra X API reads."""
+    if not authorized(update):
+        return
+    n = 3
+    if context.args:
+        try:
+            n = max(1, min(10, int(context.args[0])))
+        except ValueError:
+            pass
+    candidates = reply_candidates(STATE, limit=n)
+    if not candidates:
+        await update.message.reply_text(
+            "No fresh posts to reply to. Run /watch with some niche accounts "
+            "first (or wait for the daily refresh).")
+        return
+    await update.message.reply_text(f"Drafting {len(candidates)} replies…")
+    for cand in candidates:
+        try:
+            text = await asyncio.to_thread(
+                generate_reply, cand["text"], STATE["reply_styles"])
+        except Exception as e:
+            log.exception("reply generation failed")
+            await update.message.reply_text(f"⚠️ Reply generation failed: {e}")
+            continue
+        if text is None:
+            STATE["reply_skipped"] = (STATE["reply_skipped"] + [cand["id"]])[-200:]
+            save_state(STATE)
+            continue
+        await send_reply_draft(context, cand, text)
+
+
+async def cmd_replystyle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a REAL human reply example to emulate: /replystyle <text>.
+
+    This is the few-shot 'training' mechanism: paste actual replies you like
+    from real people in your niche and future drafts will match that voice."""
+    if not authorized(update):
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if text == "clear":
+        STATE["reply_styles"] = []
+    elif text:
+        STATE["reply_styles"] = (STATE["reply_styles"] + [text])[-10:]
+    save_state(STATE)
+    await update.message.reply_text(
+        f"{len(STATE['reply_styles'])} reply-style examples saved. "
+        "Usage: /replystyle <real reply you like> or /replystyle clear")
 
 
 async def scheduled_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -269,6 +352,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/template <structure> – add a tweet template\n"
         "/clip – source+cut a video clip now (review, post to X / TikTok)\n"
         "/channels <urls> – set YouTube source channels\n"
+        "/warmup [n] – draft replies to fresh posts from /watch accounts (review before posting)\n"
+        "/replystyle <real reply> – teach the reply voice from real human examples\n"
         "/pause /resume /status"
     )
 
@@ -482,6 +567,51 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_text("❌ Clip skipped.")
         return
 
+    # ----- reply (warm-up) actions -----
+    if action.startswith("reply"):
+        draft = STATE["reply_drafts"].get(ident)
+        if draft is None:
+            await q.edit_message_text("(reply expired)")
+            return
+        if action == "replyx":
+            try:
+                await q.edit_message_text("Posting reply…")
+            except Exception:
+                pass
+            try:
+                reply_id = await asyncio.to_thread(
+                    post_reply, draft["text"], draft["tweet_id"])
+                STATE["replied"] = (STATE["replied"] + [draft["tweet_id"]])[-500:]
+                STATE["reply_drafts"].pop(ident, None)
+                save_state(STATE)
+                await context.bot.send_message(
+                    CHAT_ID, f"🚀 Reply posted: {tweet_url(reply_id)}")
+            except Exception as e:
+                log.exception("reply post failed")
+                await context.bot.send_message(CHAT_ID, f"⚠️ Reply post failed: {e}")
+        elif action == "replyredo":
+            await q.edit_message_text("Regenerating…")
+            try:
+                new_text = await asyncio.to_thread(
+                    generate_reply, draft["original"], STATE["reply_styles"])
+            except Exception as e:
+                await context.bot.send_message(CHAT_ID, f"⚠️ Generation failed: {e}")
+                return
+            STATE["reply_drafts"].pop(ident, None)
+            save_state(STATE)
+            if new_text is None:
+                await context.bot.send_message(CHAT_ID, "Model chose to skip this one.")
+                return
+            cand = {"handle": draft["handle"], "id": draft["tweet_id"],
+                   "text": draft["original"]}
+            await send_reply_draft(context, cand, new_text)
+        else:  # replyskip
+            STATE["reply_skipped"] = (STATE["reply_skipped"] + [draft["tweet_id"]])[-200:]
+            STATE["reply_drafts"].pop(ident, None)
+            save_state(STATE)
+            await q.edit_message_text("❌ Reply skipped.")
+        return
+
     # ----- text draft actions -----
     draft_id = ident
     text = STATE["drafts"].pop(draft_id, None)
@@ -522,6 +652,8 @@ def main() -> None:
     app.add_handler(CommandHandler("template", cmd_template))
     app.add_handler(CommandHandler("clip", cmd_clip))
     app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("warmup", cmd_warmup))
+    app.add_handler(CommandHandler("replystyle", cmd_replystyle))
     app.add_handler(CallbackQueryHandler(on_button))
     # plain-text replies (speaker names) — must be last so commands take priority
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

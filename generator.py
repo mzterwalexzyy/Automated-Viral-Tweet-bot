@@ -7,8 +7,9 @@ import llm
 SYSTEM = """You are a social media ghostwriter who writes high-engagement tweets.
 Rules:
 - Max 270 characters. Plain text only, no hashtags unless they truly add value (max 1).
-- Strong hook in the first line. Be specific, opinionated, or surprising — never generic.
+- Strong hook in the first line. Be specific, opinionated, or surprising, never generic.
 - No emojis unless they fit naturally (max 1).
+- No em dashes. Use commas, periods, or "and"/"but" instead.
 - Never use cliches like "game-changer", "unlock", "in today's world".
 - Output ONLY the tweet text, nothing else."""
 
@@ -61,4 +62,5 @@ def generate_tweet(
     prompt = f"Write one tweet about: {topic}." + "".join(parts)
 
     text = llm.chat(SYSTEM, prompt, max_tokens=300, temperature=0.9).strip().strip('"')
+    text = text.replace("—", ", ").replace("–", "-")  # hard safety net
     return text[:280]
